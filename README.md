@@ -159,10 +159,12 @@ profile mid-run while still appearing to work.
 Always via the wrapper, which creates a self-contained run directory:
 
 ```sh
-./run_pcieburn.sh --duration 180 --with-nvml --with-dmon --with-aer
+./run_pcieburn.sh --duration 180 --with-nvml --with-dmon --with-aer --with-psu
 ```
 
-Use `--with-aer`. It is the only graded measurement in the set — see below.
+Use `--with-aer` — it is the only graded measurement in the set. Use
+`--with-psu` too: on this platform it is the only *trustworthy* power channel.
+Both are explained below.
 
 The wrapper gates on an interactive safety confirmation (BIOS settings, test-node
 status), snapshots provenance, optionally starts an NVML trace, runs the test,
@@ -180,6 +182,8 @@ runs/20260811T2115Z-<tag>/
   pcie_link_baseline.csv  link gen/width per GPU before any load
   aer_counters.csv      raw AER correctable counters, per GPU and root port
   aer_delta.txt         per-link error accumulation over the run (--with-aer)
+  psu_current.csv       per-PSU output current + derived watts (--with-psu)
+  psu_summary.txt       min/max/mean current, peak swing, % of PSU rating
   dmesg_delta.txt       only this run's kernel messages
   faults.txt            Xid / AER / DPC / "fallen off the bus" lines, if any
 ```
@@ -309,6 +313,87 @@ python3 ../../telemetry/bmc_power_poll.py --host 10.11.3.184 --user admin \
 # rasdaemon is already running persistently; read AER events after the fact
 ras-mc-ctl --errors
 ```
+
+## Power instrumentation on this platform — which sensors to trust
+
+Established by measurement against NVML (~3.94 kW of GPU draw under load) on
+`cptcor04`, a 4+1 × 1600 W CRPS chassis. **Every watt-denominated sensor is
+range-limited and unusable above idle:**
+
+| Sensor | Multiplier | 8-bit ceiling | Behaviour |
+|---|---|---|---|
+| `PWR_PSU*_PIN` | 1 W | 255 W | **wraps** — printed 3 W at load onset |
+| `PWR_PSU*_POUT` | 2 W | 510 W | **saturates** — never exceeds ~440 W |
+| `CurConsumedWatts` / DCMI | derived from `PIN` | 255 W | garbage above idle |
+| `CUR_PSU*_IOUT` | 0.6 A | ~153 A | **works** — 13.2 A idle → 81.6 A load |
+
+At idle the watt sensors are exactly right, which is what made this hard to
+spot. Three independent checks confirm it: `IOUT × VOLT_12V` = `POUT` exactly
+(13.20 A × 12.3 V = 162 W), `POUT/PIN` = 86% (a credible CRPS efficiency), and
+`PIN1 + PIN2` = the DCMI system total exactly. Nothing is miscalibrated — the
+watt sensors simply cannot count that high.
+
+So use current, not watts. `--with-psu` records `CUR_PSU1/2_IOUT` and derives
+watts from the measured 12 V rail. `telemetry/bmc_power_poll.py` gained the same
+columns (`psu*_iout_a`, `psu*_pout_calc_w`, `est_system_w`), appended so older
+traces stay column-compatible.
+
+Two caveats worth carrying forward:
+
+- **Only 2 of the 5 CRPS units are instrumented at all** — no interface exposes
+  the others. `est_system_w` extrapolates from the instrumented pair assuming
+  even sharing across `--active-supplies` (default 4). Measured peak of 81.6 A
+  per supply implies 4-way sharing: 4 × ~1004 W ≈ 4.0 kW, against NVML's 4.2 kW
+  total. Five-way sharing would predict 68 A, which is 20% off. It is an
+  estimate, not a measurement.
+- **Steady-state loading is comfortable:** ~63% of the 1600 W rating per supply,
+  ~65% of the 6400 W redundant capacity. Capacity is not the problem.
+
+## The power-transient hypothesis, and how to test it
+
+The most promising open hypothesis, which fits the evidence better than "PCIe
+traffic causes it":
+
+`IOUT` swings 42 → 81.6 A per instrumented supply — a ~2 kW load step across
+four active supplies. And **the collective is a barrier, so all 8 GPUs enter
+their GEMM burst simultaneously**, making their power transients *correlated*
+rather than averaging out. Correlated sub-millisecond excursions across eight
+575 W-class cards is close to the worst case for PSU transient response, and rail
+droop costs PCIe link margin — which is exactly what `REPLAY_NUM Rollover`
+(data-link-layer retries) indicates.
+
+It accounts for every existing observation: `diag` reproduces (8 GPUs, unpaced
+GEMMs, maximal correlated transients); `pcie`/`memory_bandwidth`/`nccl-tests`
+never do (low compute power, small transients); pcieburn reproduced at only
+**2.4%** average bus utilization; and only ~2 of 8 GPUs ever fail, those being
+the slots with the least margin.
+
+Two experiments discriminate it:
+
+```sh
+# 1. Cap power, hold traffic constant. Needs no code change.
+nvidia-smi -q -d POWER | grep -i 'power limit'    # record the default first
+nvidia-smi -pl 400
+./run_pcieburn.sh --duration 180 --with-nvml --with-aer --with-psu --tag pl400
+nvidia-smi -pl <default>                           # restore
+
+# 2. De-correlate the ranks so their peaks do not align.
+./run_pcieburn.sh --duration 180 --with-aer --with-psu --tag stagger \
+    -- --rank-stagger 5
+```
+
+If either stops faulting — or measurably lowers the `Rollover` rate — while
+still moving the same collective bytes, power transients are implicated and PCIe
+traffic is exonerated.
+
+Note on #1: a lower cap lowers clocks, so GEMM bursts lengthen and collectives
+occur less often per second. Drop `--gemms-per-coll` proportionally to hold the
+collective rate constant.
+
+Note on #2: `--rank-stagger` is **deliberately less faithful**. Real
+tensor-parallel inference genuinely is synchronized, so a stagger is a diagnostic
+manipulation, not a fix. If it helps, the remedy is electrical or platform-level,
+not software.
 
 ## Safety
 

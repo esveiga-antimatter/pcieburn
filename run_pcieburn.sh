@@ -25,6 +25,10 @@ WITH_NVML=0
 WITH_DMON=0
 WITH_AER=0
 AER_INTERVAL=1
+WITH_PSU=0
+PSU_INTERVAL=0.25
+ACTIVE_SUPPLIES=4
+PSU_RATING_W=1600
 NVML_INTERVAL_MS=100
 DURATION=""
 ASSUME_YES=0
@@ -52,6 +56,17 @@ Wrapper options:
                       can rank configurations without having to reach a fault
                       and reboot. Strongly recommended.
   --aer-interval SEC  AER poll interval (default 1)
+  --with-psu          poll per-PSU output CURRENT via IPMI. On this platform
+                      CUR_PSU*_IOUT is the only power sensor with adequate
+                      range: PWR_*_PIN wraps at 255 W and PWR_*_POUT saturates
+                      near 510 W, so both (and DCMI, which derives from PIN)
+                      read garbage above idle. Current does not.
+  --psu-interval SEC  PSU current poll interval (default 0.25)
+  --active-supplies N assumed number of load-sharing PSUs, used only for the
+                      estimated system power column (default 4, from measured
+                      4-way sharing on a 4+1 1600W CRPS chassis)
+  --psu-rating W      per-supply rating, for the %-of-rating column (default
+                      1600, matching this chassis's CRPS units)
   --nvml-interval MS  NVML sample interval (default 100)
   --yes               skip the interactive safety confirmation
   -h, --help          this message
@@ -72,6 +87,10 @@ while [[ $# -gt 0 ]]; do
         --with-dmon)     WITH_DMON=1; shift ;;
         --with-aer)      WITH_AER=1; shift ;;
         --aer-interval)  AER_INTERVAL="$2"; shift 2 ;;
+        --with-psu)      WITH_PSU=1; shift ;;
+        --psu-interval)  PSU_INTERVAL="$2"; shift 2 ;;
+        --active-supplies) ACTIVE_SUPPLIES="$2"; shift 2 ;;
+        --psu-rating)    PSU_RATING_W="$2"; shift 2 ;;
         --nvml-interval) NVML_INTERVAL_MS="$2"; shift 2 ;;
         --yes|-y)        ASSUME_YES=1; shift ;;
         -h|--help)       usage; exit 0 ;;
@@ -99,6 +118,8 @@ DMON="$RUNDIR/pcie_dmon.txt"
 LINKSTATES="$RUNDIR/pcie_link_states.txt"
 AER="$RUNDIR/aer_counters.csv"
 AERDELTA="$RUNDIR/aer_delta.txt"
+PSUCSV="$RUNDIR/psu_current.csv"
+PSUSUM="$RUNDIR/psu_summary.txt"
 
 # --- safety gate ----------------------------------------------------------
 if [[ $ASSUME_YES -eq 0 ]]; then
@@ -279,6 +300,56 @@ if [[ $WITH_AER -eq 1 ]]; then
     fi
 fi
 
+# --- PSU output current ---------------------------------------------------
+# `ipmitool sensor reading <name>...` is far cheaper than `sdr elist full`
+# (one IPMI transaction per named sensor, no full SDR walk), which is what makes
+# a few Hz achievable over the local KCS interface.
+PSU_PID=""
+if [[ $WITH_PSU -eq 1 ]]; then
+    if ! sudo -n ipmitool sensor reading CUR_PSU1_IOUT >/dev/null 2>&1; then
+        say "WARNING: cannot read CUR_PSU1_IOUT via ipmitool (needs sudo and"
+        say "         the ipmi_devintf/ipmi_si modules); skipping PSU capture"
+        WITH_PSU=0
+    else
+        # VOLT_12V may not exist under that name; fall back to a nominal 12.0.
+        PSU_HAS_V12=0
+        if sudo -n ipmitool sensor reading VOLT_12V >/dev/null 2>&1; then
+            PSU_HAS_V12=1
+        fi
+        echo "timestamp,psu1_iout_a,psu2_iout_a,volt_12v,psu1_w,psu2_w,pair_w,est_system_w" \
+            > "$PSUCSV"
+        say "polling PSU output current every ${PSU_INTERVAL}s -> $PSUCSV"
+        (
+            names="CUR_PSU1_IOUT CUR_PSU2_IOUT"
+            [[ $PSU_HAS_V12 -eq 1 ]] && names="$names VOLT_12V"
+            while :; do
+                ts=$(ts_iso)
+                # shellcheck disable=SC2086
+                sudo -n ipmitool sensor reading $names 2>/dev/null | awk -F'|' \
+                    -v ts="$ts" -v n="$ACTIVE_SUPPLIES" '
+                    {
+                        gsub(/^[ \t]+|[ \t]+$/, "", $1)
+                        gsub(/^[ \t]+|[ \t]+$/, "", $2)
+                        v[$1] = $2 + 0
+                    }
+                    END {
+                        i1 = v["CUR_PSU1_IOUT"]; i2 = v["CUR_PSU2_IOUT"]
+                        vv = ("VOLT_12V" in v && v["VOLT_12V"] > 6) ? v["VOLT_12V"] : 12.0
+                        w1 = i1 * vv; w2 = i2 * vv
+                        # est_system_w assumes the instrumented pair is
+                        # representative and load is shared evenly across n
+                        # supplies. It is an estimate, not a measurement.
+                        est = (i1 + i2) > 0 ? ((w1 + w2) / 2.0) * n : 0
+                        printf "%s,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f\n",
+                            ts, i1, i2, vv, w1, w2, w1 + w2, est
+                    }' >> "$PSUCSV"
+                sleep "$PSU_INTERVAL"
+            done
+        ) &
+        PSU_PID=$!
+    fi
+fi
+
 DMON_PID=""
 if [[ $WITH_DMON -eq 1 ]]; then
     say "starting PCIe throughput trace (dmon) -> $DMON"
@@ -296,6 +367,7 @@ TAIL_PID=""
 : "${AER_PID:=}"
 : "${DMON_PID:=}"
 : "${NVML_PID:=}"
+: "${PSU_PID:=}"
 cleanup() {
     local rc=$?
     trap - EXIT INT TERM
@@ -335,6 +407,12 @@ cleanup() {
         say "stopping AER counter poll"
         kill -TERM "$AER_PID" 2>/dev/null
         wait "$AER_PID" 2>/dev/null
+    fi
+
+    if [[ -n "$PSU_PID" ]] && kill -0 "$PSU_PID" 2>/dev/null; then
+        say "stopping PSU current poll"
+        kill -TERM "$PSU_PID" 2>/dev/null
+        wait "$PSU_PID" 2>/dev/null
     fi
     exit $rc
 }
@@ -446,6 +524,45 @@ if [[ $WITH_AER -eq 1 && -n "$AER_TARGETS" ]]; then
     fi
 fi
 
+# PSU current summary. The headline figures are peak per-supply load against the
+# CRPS rating, and the size of the current SWING — the latter is the transient
+# that the correlated-power hypothesis is about, and it is invisible in any of
+# the watt-denominated sensors on this platform.
+if [[ $WITH_PSU -eq 1 && -s "$PSUCSV" ]]; then
+    awk -F',' -v n="$ACTIVE_SUPPLIES" -v rating="$PSU_RATING_W" '
+        NR > 1 && $2 + 0 > 0 {
+            for (k = 2; k <= 3; k++) {
+                c = $k + 0
+                if (c > mx[k]) mx[k] = c
+                if (mn[k] == "" || c < mn[k]) mn[k] = c
+                s[k] += c
+            }
+            cnt++
+            if ($7 + 0 > pairmx) pairmx = $7 + 0
+            if ($8 + 0 > estmx)  estmx  = $8 + 0
+        }
+        END {
+            if (!cnt) { print "no usable samples"; exit }
+            amps = rating / 12.0
+            printf "samples                  %d\n", cnt
+            printf "PSU1 IOUT                min %6.2f A   max %6.2f A   mean %6.2f A\n",
+                mn[2], mx[2], s[2] / cnt
+            printf "PSU2 IOUT                min %6.2f A   max %6.2f A   mean %6.2f A\n",
+                mn[3], mx[3], s[3] / cnt
+            printf "peak swing PSU1          %6.2f A  (~%.0f W at 12V)\n",
+                mx[2] - mn[2], (mx[2] - mn[2]) * 12.0
+            printf "peak swing PSU2          %6.2f A  (~%.0f W at 12V)\n",
+                mx[3] - mn[3], (mx[3] - mn[3]) * 12.0
+            printf "peak instrumented pair   %.0f W\n", pairmx
+            printf "peak est. system (x%d)    %.0f W   [estimate, assumes even sharing]\n",
+                n, estmx
+            printf "peak per-supply load     %.0f%% of %.0fW rating (%.0f A max)\n",
+                100.0 * mx[2] / amps, rating, amps
+            printf "\nNote: sampled at the poll interval, so these are envelope\n"
+            printf "values. Sub-millisecond excursions are not visible here.\n"
+        }' "$PSUCSV" > "$PSUSUM" 2>/dev/null || true
+fi
+
 {
     echo
     echo "end_utc           : $(ts_iso)"
@@ -464,6 +581,10 @@ say "  pcieburn.log   timestamped console output"
 say "  events.csv     per-rank event log for telemetry correlation"
 [[ $WITH_NVML -eq 1 ]] && say "  nvml_trace.csv per-GPU NVML trace incl. PCIe link gen/width"
 [[ $WITH_DMON -eq 1 ]] && say "  pcie_dmon.txt  PCIe rx/tx throughput (independent cross-check)"
+if [[ -s "$PSUSUM" ]]; then
+    say "  psu_current.csv / psu_summary.txt  per-PSU output current:"
+    while IFS= read -r l; do [[ -n "$l" ]] && say "      $l"; done < "$PSUSUM"
+fi
 if [[ -s "$AERDELTA" ]]; then
     say "  aer_counters.csv / aer_delta.txt  per-link AER accumulation:"
     while IFS= read -r l; do say "      $l"; done < "$AERDELTA"

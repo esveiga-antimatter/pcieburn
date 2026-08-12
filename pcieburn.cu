@@ -331,6 +331,12 @@ struct Config {
     double memFrac        = 0.9;       // DCGM/gpu-burn USEMEM
     size_t maxCBuffers    = 0;         // 0 = unlimited
     bool explicitStream   = false;     // default: legacy NULL stream, as DCGM
+    // Delay rank N's GEMM burst by N * this, every pass. Purely diagnostic: it
+    // de-correlates the per-GPU power transients that the collective barrier
+    // otherwise aligns. Real tensor-parallel inference IS synchronized, so a
+    // nonzero stagger is deliberately LESS faithful — it exists to test whether
+    // correlated current steps across 8 cards are part of the mechanism.
+    double rankStaggerMs  = 0.0;
     bool alwaysTensor     = false;
     bool doCompare        = true;
     double collTimeout    = 120.0;     // in-rank stream poll timeout, 0 = off
@@ -866,6 +872,13 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
             const size_t collSz  = collSizeFor(cfg, outerIter);
             const size_t chunk   = cfg.gemmsPerColl ? cfg.gemmsPerColl : iters;
 
+            // Stagger before the timing window opens, so it is excluded from the
+            // throughput measurement. The end-of-pass collective re-absorbs the
+            // skew (later ranks simply arrive later), so every rank still issues
+            // an identical number of collectives and nothing can deadlock.
+            if (cfg.rankStaggerMs > 0.0 && rank > 0)
+                usleep((useconds_t)(cfg.rankStaggerMs * 1000.0 * rank));
+
             const double passStart = nowSec();
             CUDA_CHECK(cudaEventRecord(db.evGemmStart, stream));
 
@@ -1082,6 +1095,12 @@ static void usage(const char *argv0)
 "  --max-c-buffers N     cap the C buffer count (default 0 = unlimited)\n"
 "  --gpus LIST           comma list of device indices (default all visible)\n"
 "  --stream MODE         legacy | explicit (default legacy, as DCGM/gpu-burn)\n"
+"  --rank-stagger MS     delay rank N's GEMM burst by N*MS every pass, to\n"
+"                        de-correlate per-GPU power transients (default 0).\n"
+"                        Diagnostic only: real tensor-parallel inference is\n"
+"                        synchronized, so nonzero values are LESS faithful.\n"
+"                        Use it to test whether correlated current steps across\n"
+"                        all GPUs are part of the failure mechanism.\n"
 "  --always-tensor       enable tensor-op math from the start, not at halfway\n"
 "  --no-compare          skip result verification (pure load)\n"
 "  --coll-timeout SEC    per-rank hang timeout (default 120, 0 = off)\n"
@@ -1192,6 +1211,13 @@ static bool parseArgs(int argc, char **argv, Config &cfg)
             else if (!strcmp(v, "explicit")) cfg.explicitStream = true;
             else {
                 fprintf(stderr, "--stream must be legacy or explicit\n");
+                return false;
+            }
+        } else if (!strcmp(a, "--rank-stagger")) {
+            if (!next(&v)) return false;
+            cfg.rankStaggerMs = atof(v);
+            if (cfg.rankStaggerMs < 0.0) {
+                fprintf(stderr, "--rank-stagger must be >= 0\n");
                 return false;
             }
         } else if (!strcmp(a, "--always-tensor")) {
@@ -1428,6 +1454,10 @@ int main(int argc, char **argv)
         logf_("  duration=%.0fs matrix_dim=%u precision=%s stream=%s",
               cfg.duration, cfg.matrixDim, precList.c_str(),
               cfg.explicitStream ? "explicit" : "legacy");
+        if (cfg.rankStaggerMs > 0.0)
+            logf_("  rank_stagger=%.2fms per rank (power transients "
+                  "DE-CORRELATED — diagnostic mode, less faithful than "
+                  "synchronized)", cfg.rankStaggerMs);
         const std::string burstDesc =
             cfg.gemmsPerColl ? std::to_string(cfg.gemmsPerColl) : "full-burst";
         logf_("  collective=%s sweep %zuMiB..%zuMiB x%u (%zu sizes) "
