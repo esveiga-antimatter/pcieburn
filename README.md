@@ -4,6 +4,18 @@ Combined GEMM-burst and NCCL-collective load generator, built to close the gap
 between DCGM's `diagnostic` sub-test (which hammers compute and moves no data)
 and `nccl-tests` (which moves data and barely touches compute).
 
+| File | Purpose |
+|---|---|
+| `pcieburn.cu` | The harness: supervisor + per-GPU rank processes, GEMM burst, collectives, compare kernels |
+| `Makefile` | `make preflight` to check the resolved toolchain, then `make` |
+| `run_pcieburn.sh` | Run wrapper: safety gate, provenance, telemetry, orphan-free cleanup |
+| `linkcheck.sh` | **Zero-cost PCIe link health screen — no load, safe on any node, usable as a fleet sweep** |
+| `plot_run.gp` | Interactive gnuplot explorer for a run directory (`PNG=1` writes image files) |
+
+If you are triaging a node rather than stress-testing one, start with
+`linkcheck.sh`. It needs no CUDA, applies no load, and on this fleet it has
+flagged the failing GPU before any test was run.
+
 ## Which design option this is, and why
 
 **This is Option B** — a custom harness that interleaves compute and collectives
@@ -179,9 +191,17 @@ runs/20260811T2115Z-<tag>/
   pcie_dmon.txt         PCIe rx/tx throughput, independent of pcieburn's own
                         byte accounting (--with-dmon)
   pcie_link_states.txt  distinct PCIe link states observed, with sample counts
-  pcie_link_baseline.csv  link gen/width per GPU before any load
+  pcie_link_baseline.csv  link gen/width per GPU before any load, via NVML
+  pcie_link_rootports.txt   root-port link state before load (authoritative)
+  pcie_link_rootports.csv   the same, machine-readable
+  pcie_link_rootports_after.txt  re-read after the run; a link that was at
+                        capability before and below it after is a strong signal,
+                        and the wrapper flags the difference on the console
   aer_counters.csv      raw AER correctable counters, per GPU and root port
   aer_delta.txt         per-link error accumulation over the run (--with-aer)
+  aer_uncorrectable.csv NONZERO uncorrectable/fatal AER rows only — names the
+                        actual fatal error; empty on a healthy run
+  aer_baseline.txt      complete starting state of all three AER registers
   psu_current.csv       per-PSU output current + derived watts (--with-psu)
   psu_summary.txt       min/max/mean current, peak swing, % of PSU rating
   dmesg_delta.txt       only this run's kernel messages
@@ -215,11 +235,51 @@ marginal signal integrity rather than a logical or thermal problem. A clean run
 where two links accumulate Rollovers and six do not is a *result*, and it costs
 no reboot.
 
+### `aer_uncorrectable.csv` — which fatal error, and the Surprise-Down question
+
+The correctable counters say the link is struggling. The **uncorrectable** register
+says what finally killed it, and that distinction discriminates between competing
+mechanisms:
+
+| Field | Meaning |
+|---|---|
+| `SDES` | **Surprise Down** — the link dropped with no warning, i.e. the device stopped responding |
+| `DLP` | Data Link Protocol error |
+| `RxOF` | Receiver overflow |
+| `MalfTLP` | Malformed TLP |
+| `CmpltTO` | Completion timeout |
+
+A **power-brownout** story predicts `SDES`: the GPU momentarily vanishes and the
+link surprise-drops. A **margin-erosion** story predicts no `SDES` — correctable
+errors accumulate, replays exhaust, and the device signals `ERR_FATAL` over a
+still-working link. Both reproductions on `cptcor04` logged
+`DPC: containment event, ERR_FATAL received from 0000:01:00.0` with no Surprise
+Down anywhere, which favours the latter — but until this file existed we could
+not see which uncorrectable bit the device actually set.
+
+**Why it must be sampled during the run:** by the time the kernel tries to read
+the device's AER state, DPC has already contained the link, which is exactly why
+the log says `can't recover (no error_detected callback)`. A post-mortem cannot
+recover it.
+
+Only nonzero rows are written, so the file is empty on a healthy run and any
+content at all is significant. The field set is not hardcoded — it is read from
+whatever the kernel exposes, since it varies by version. `aer_baseline.txt` holds
+the complete starting state of all three registers for reference.
+
 `pcie_link_states.txt` exists to catch downtraining — a link dropping below
-Gen5 x16 under load is the step before falling off the bus entirely. Read it
-with one caveat: consumer cards legitimately downtrain to Gen1 when idle, and
-the trace spans the idle periods either side of the load phase, so a Gen1 sample
-is only meaningful if its timestamp falls inside the load window.
+Gen5 x16 is the step before falling off the bus entirely.
+
+**Do not dismiss a low idle link speed as power saving on this platform.** An
+earlier version of this README said exactly that, and it was wrong: all eight
+root ports report `ASPM Disabled` with `Target Link Speed: 32GT/s`, so there is
+no power-management mechanism that would legitimately drop a link to Gen1. A port
+below its capability here is a hardware indicator. On `cptcor04` the GPU that
+idles at 2.5GT/s while its seven identical peers hold 32GT/s is one of the two
+that have historically fallen off the bus.
+
+`linkcheck.sh` encodes that distinction and is the authoritative check — see
+below.
 
 Useful configurations:
 
@@ -313,6 +373,83 @@ python3 ../../telemetry/bmc_power_poll.py --host 10.11.3.184 --user admin \
 # rasdaemon is already running persistently; read AER events after the fact
 ras-mc-ctl --errors
 ```
+
+## `linkcheck.sh` — zero-cost link health screen
+
+Run this on any GPU node, including ones you have no intention of stress-testing.
+It reads each GPU's upstream **root port** config space and compares the
+negotiated link speed and width against that port's own capability. No load, no
+GPU state touched, no risk of taking a node down.
+
+```sh
+sudo ./linkcheck.sh              # table
+sudo ./linkcheck.sh --csv        # machine-readable
+sudo ./linkcheck.sh --with-index # add nvidia-smi indices (uses NVML)
+watch -n 10 'sudo ./linkcheck.sh'
+```
+
+Exit status is 0 when every link is at capability, 1 when any is not — so it
+drops straight into a fleet sweep.
+
+Two design points that matter:
+
+- **It reads the root port, not the GPU.** Reading an *endpoint's* config space
+  requires the link to be in L0, so querying the GPU (or NVML) can wake a link
+  out of a low-power state and perturb the very thing being measured. The root
+  port's `LnkSta` describes the same link and is local to the host bridge. GPU
+  enumeration is pure sysfs for the same reason.
+- **The verdict depends on ASPM**, because that is what makes a low speed
+  interpretable:
+
+| Verdict | Meaning |
+|---|---|
+| `DEGRADED` | below capability **while ASPM is disabled** — no power-management explanation exists, treat as a hardware indicator |
+| `LOW` | below capability but ASPM is enabled, so it may be legitimate; re-check under load |
+| `OK` | at full capability |
+
+### Boards with a PCIe switch
+
+Some machines in this fleet use a switchboard instead of risers, which inserts a
+hop:
+
+```
+riser board:      root port ─────────────────────────────► GPU
+switch board:     root port ─► switch upstream ─┬─► downstream ─► GPU
+                                                └─► downstream ─► GPU  ...
+```
+
+Three consequences, all of which the tooling now accounts for:
+
+- **`linkcheck.sh` and the AER poller walk the whole path**, not just the GPU's
+  immediate parent. On a switch board that parent is the *downstream* port, so
+  looking one hop up would leave the root-port↔switch link unmonitored — and
+  that link carries every GPU behind the switch.
+- **A containment event upstream takes down every GPU behind the switch.** The
+  runbook records that "exactly one GPU fails while the other seven hold" — that
+  invariant is a property of the riser topology and should *not* be expected
+  here. Multiple GPUs dropping together on a switch board is ordinary DPC scope,
+  not a new phenomenon.
+- **P2P may be available** between GPUs under the same switch, so NCCL can route
+  peer traffic directly instead of staging through host RAM. The wrapper detects
+  this from `nvidia-smi topo -p2p r` and says so. Per-rank link byte totals are
+  unaffected — a rank's own link still carries egress plus ingress either way —
+  but host DRAM traffic and shared-upstream-link load differ, so communication
+  behaviour is not directly comparable against a P2P-disabled node.
+
+Each link is judged against **its own** capability, so a switch that is
+legitimately Gen4, or a bifurcated x8 slot, reports `OK` rather than `DEGRADED`.
+
+A degraded link can be restored without rebooting, by writing the Retrain Link
+bit on the port above it:
+
+```sh
+sudo setpci -s 00:01.1 CAP_EXP+10.w=0020:0020
+```
+
+On `cptcor04` that brings the link straight back to 32GT/s and it becomes
+register-identical to its healthy peers. **Whether it then holds that speed while
+idle is the actual diagnostic** — a link that retrains fine but will not stay up
+is the signature seen here.
 
 ## Power instrumentation on this platform — which sensors to trust
 

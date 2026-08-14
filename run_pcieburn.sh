@@ -118,6 +118,8 @@ DMON="$RUNDIR/pcie_dmon.txt"
 LINKSTATES="$RUNDIR/pcie_link_states.txt"
 AER="$RUNDIR/aer_counters.csv"
 AERDELTA="$RUNDIR/aer_delta.txt"
+AER_UNCORR="$RUNDIR/aer_uncorrectable.csv"
+AER_BASE="$RUNDIR/aer_baseline.txt"
 PSUCSV="$RUNDIR/psu_current.csv"
 PSUSUM="$RUNDIR/psu_summary.txt"
 
@@ -140,6 +142,16 @@ EOF
     [[ "$reply" == "y" || "$reply" == "Y" ]] || { echo "aborted."; exit 1; }
 fi
 
+# --- uptime -----------------------------------------------------------------
+# Captured explicitly rather than derived later. Reproduction has correlated with
+# time since cold boot, and the only previous way to recover it was the first
+# timestamp in dmesg_before.txt, which is unavailable when the kernel log is
+# restricted.
+UPTIME_S=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)
+UPTIME_H=$(printf '%dh %02dm %02ds' $((UPTIME_S/3600)) $(((UPTIME_S%3600)/60)) $((UPTIME_S%60)))
+BOOT_UTC=$(date -u -d "@$(( $(date +%s) - UPTIME_S ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
+say "uptime at start: $UPTIME_H (booted $BOOT_UTC)"
+
 # --- provenance -----------------------------------------------------------
 {
     echo "pcieburn run manifest"
@@ -151,6 +163,12 @@ fi
     echo "binary            : $BIN"
     echo "pcieburn_args      : ${PASSTHRU[*]:-<defaults>}"
     [[ -n "$DURATION" ]] && echo "duration          : ${DURATION}s"
+    # Uptime is recorded because it turned out to correlate with reproduction and
+    # was previously only recoverable by digging the first timestamp out of
+    # dmesg_before.txt — which fails entirely when the kernel log is restricted.
+    echo "uptime_seconds    : $UPTIME_S"
+    echo "uptime_human      : $UPTIME_H"
+    echo "boot_utc          : $BOOT_UTC"
     echo
     echo "--- git ---"
     git -C "$HERE" rev-parse HEAD 2>/dev/null || echo "(not a git repo)"
@@ -165,29 +183,75 @@ fi
     echo "--- nvidia-smi -L ---"
     nvidia-smi -L 2>&1 || true
     echo
-    echo "--- PCIe link capability vs current (baseline before load) ---"
+    echo "--- GPU power limits (an applied -pl persists for the whole boot"
+    echo "    session, so a run that does not set it inherits the previous"
+    echo "    value; recorded here so every run is self-auditing) ---"
+    nvidia-smi --query-gpu=index,power.limit,power.default_limit,enforced.power.limit,power.min_limit,power.max_limit \
+        --format=csv 2>&1 \
+        || nvidia-smi -q -d POWER 2>&1 | grep -iE 'GPU 0000|Power Limit' \
+        || true
+    echo
+    echo "--- PCIe link capability vs current, via NVML (baseline before load) ---"
     nvidia-smi --query-gpu=index,pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current \
         --format=csv 2>&1 || true
+    echo
+    echo "--- PCIe root-port link state (non-perturbing; see linkcheck.sh) ---"
+    if [[ -x "$HERE/linkcheck.sh" ]]; then
+        "$HERE/linkcheck.sh" 2>&1 || true
+    else
+        echo "(linkcheck.sh not found next to this script)"
+    fi
     echo
     echo "--- NUMA affinity (cross-socket staging matters: P2P is disabled) ---"
     nvidia-smi topo -m 2>&1 | head -25 || true
 } > "$MANIFEST"
 
-# Baseline PCIe link check, before any load. Worth surfacing rather than burying
-# in the manifest: in the first reproduction on this node, the only GPU idling at
-# a lower link generation than its peers was the one that fell off the bus.
+# Baseline PCIe link check, before any load, from the root-port side. This is the
+# authoritative view: reading the ENDPOINT's config space requires the link to be
+# in L0, so an NVML or endpoint query can itself wake a link and perturb the
+# measurement. The root port reports the same link and is local to the host bridge.
+#
+# On this platform ASPM is Disabled on every root port with Target Link Speed at
+# maximum, so a link idling below its capability has NO power-management
+# explanation — it is a hardware indicator, not normal power saving. linkcheck.sh
+# encodes that distinction (DEGRADED vs LOW) and is the single source of truth.
 BASELINE_LINK="$RUNDIR/pcie_link_baseline.csv"
-if nvidia-smi --query-gpu=index,pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current \
-        --format=csv,noheader,nounits > "$BASELINE_LINK" 2>/dev/null; then
-    ODD_LINKS=$(awk -F', *' 'NF>=5 && ($3+0 < $2+0 || $5+0 < $4+0) {
-        printf "GPU%s at gen%s x%s (max gen%s x%s)\n", $1, $3, $5, $2, $4 }' \
-        "$BASELINE_LINK" 2>/dev/null)
-    if [[ -n "$ODD_LINKS" ]]; then
-        say "NOTE: PCIe link(s) below maximum at idle:"
-        while IFS= read -r l; do say "    $l"; done <<< "$ODD_LINKS"
-        say "    Idle downtraining is normal power saving, but a card that"
-        say "    differs from its peers is a signal worth recording."
+ROOTPORT_LINK="$RUNDIR/pcie_link_rootports.txt"
+
+# Keep the NVML view too, for comparison against the root-port view.
+nvidia-smi --query-gpu=index,pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current \
+    --format=csv,noheader,nounits > "$BASELINE_LINK" 2>/dev/null || true
+
+# Topology check. On a board with a PCIe switch, GPUs behind the same switch may
+# be able to reach each other directly instead of staging through host RAM —
+# which changes NCCL's transport, the traffic pattern, and how much of it crosses
+# the shared upstream link. The runbook's premise that every byte is host-staged
+# is specific to boards where P2P reports CNS on all pairs.
+if nvidia-smi topo -p2p r 2>/dev/null | grep -qE '\bOK\b'; then
+    say "NOTE: PCIe P2P is available between some GPU pairs on this host."
+    say "    NCCL will route peer traffic directly rather than staging through"
+    say "    host RAM, so the collective traffic pattern differs from a"
+    say "    P2P-disabled node and the two are not directly comparable on the"
+    say "    communication axis. Per-rank link byte totals are unaffected"
+    say "    (a rank's own link still carries its egress plus its ingress),"
+    say "    but host DRAM traffic and shared-upstream-link load will differ."
+fi
+
+if [[ -x "$HERE/linkcheck.sh" ]]; then
+    "$HERE/linkcheck.sh" > "$ROOTPORT_LINK" 2>&1
+    LINK_RC=$?
+    "$HERE/linkcheck.sh" --csv > "$RUNDIR/pcie_link_rootports.csv" 2>/dev/null || true
+    if [[ $LINK_RC -ne 0 ]]; then
+        say "NOTE: PCIe link(s) below capability before any load:"
+        while IFS= read -r l; do
+            [[ "$l" =~ (DEGRADED|LOW)$ ]] && say "    $l"
+        done < "$ROOTPORT_LINK"
+        say "    DEGRADED means below capability while ASPM is DISABLED — there is"
+        say "    no power-management explanation for it. On this platform that has"
+        say "    marked the GPU that subsequently fell off the bus."
     fi
+else
+    say "WARNING: linkcheck.sh not found; skipping root-port link check"
 fi
 
 # Kernel log watermark, so the after-diff shows only this run's messages.
@@ -236,7 +300,16 @@ fi
 AER_FIELDS="RxErr BadTLP BadDLLP Rollover Timeout NonFatalErr CorrIntErr HeaderOF"
 
 aer_targets() {
-    # Emits "index bdf role" for each GPU and for its upstream root port.
+    # Emits "index bdf role" for each GPU and for EVERY port in its PCIe path.
+    #
+    # Walking the whole ancestry rather than just the immediate parent matters on
+    # boards with a PCIe switch, where the topology is
+    #     root port -> switch upstream -> switch downstream -> GPU
+    # so the GPU's parent is the switch downstream port and the root-port-to-
+    # switch link would otherwise go unmonitored. That upstream link carries
+    # every GPU behind the switch, and a containment event there takes all of
+    # them down at once. On riser boards the chain is just root port -> GPU and
+    # this yields exactly the two targets it always did.
     nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader,nounits \
         2>/dev/null | while IFS=',' read -r idx bus; do
         idx="${idx// /}"
@@ -244,34 +317,63 @@ aer_targets() {
         bdf=$(printf '%s' "$bus" | tr -d ' ' | tr 'A-Z' 'a-z' | sed 's/^0000//')
         [[ -e "/sys/bus/pci/devices/$bdf" ]] || continue
         echo "$idx $bdf dev"
-        local rp
-        rp=$(basename "$(dirname "$(readlink -f \
-            "/sys/bus/pci/devices/$bdf" 2>/dev/null)")" 2>/dev/null) || rp=""
-        if [[ -n "$rp" && -e "/sys/bus/pci/devices/$rp" ]]; then
-            echo "$idx $rp rootport"
-        fi
+
+        local -a chain=()
+        local n i role
+        mapfile -t chain < <(readlink -f "/sys/bus/pci/devices/$bdf" 2>/dev/null \
+            | tr '/' '\n' \
+            | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$')
+        n=${#chain[@]}
+        for (( i = 0; i < n - 1; i++ )); do
+            [[ -e "/sys/bus/pci/devices/${chain[$i]}" ]] || continue
+            if (( i == 0 )); then role="rootport"; else role="switch"; fi
+            echo "$idx ${chain[$i]} $role"
+        done
     done
 }
 
 aer_snapshot() {
-    # One CSV row per target. Counters are cumulative since boot, so deltas are
-    # what matter; absolute values are logged and differenced afterwards.
-    local targets="$1" out="$2" ts
+    # Correctable counters go to a wide CSV (fixed columns, differenced later).
+    # Counters are cumulative since boot, so deltas are what matter.
+    #
+    # UNCORRECTABLE counters go to a separate long-format file, and only rows
+    # with a nonzero count are emitted. Two reasons: the field set differs
+    # between kernel versions so hardcoding columns would break, and these are
+    # zero right up until the fatal event — so a sparse file makes the signal
+    # unmissable instead of burying it in a wall of zeros.
+    #
+    # This is the register that names WHICH fatal error the device reported.
+    # `SDES` is Surprise Down Error — its presence or absence discriminates a
+    # device that momentarily vanished from one that degraded and then signalled
+    # ERR_FATAL over a working link. The post-mortem cannot supply this: by the
+    # time the kernel tries to read the device's AER state, DPC has already
+    # contained the link ("can't recover (no error_detected callback)").
+    local targets="$1" out="$2" ts base cls
     ts=$(ts_iso)
     while read -r idx bdf role; do
         [[ -n "${bdf:-}" ]] || continue
-        local f="/sys/bus/pci/devices/$bdf/aer_dev_correctable"
-        [[ -r "$f" ]] || continue
-        awk -v ts="$ts" -v g="$idx" -v b="$bdf" -v r="$role" \
-            -v fields="$AER_FIELDS" '
-            { v[$1] = $2 }
-            END {
-                n = split(fields, F, " ")
-                printf "%s,%s,%s,%s", ts, g, b, r
-                for (i = 1; i <= n; i++)
-                    printf ",%s", (F[i] in v) ? v[F[i]] : ""
-                printf "\n"
-            }' "$f" >> "$out"
+        base="/sys/bus/pci/devices/$bdf"
+
+        if [[ -r "$base/aer_dev_correctable" ]]; then
+            awk -v ts="$ts" -v g="$idx" -v b="$bdf" -v r="$role" \
+                -v fields="$AER_FIELDS" '
+                { v[$1] = $2 }
+                END {
+                    n = split(fields, F, " ")
+                    printf "%s,%s,%s,%s", ts, g, b, r
+                    for (i = 1; i <= n; i++)
+                        printf ",%s", (F[i] in v) ? v[F[i]] : ""
+                    printf "\n"
+                }' "$base/aer_dev_correctable" >> "$out"
+        fi
+
+        for cls in fatal nonfatal; do
+            [[ -r "$base/aer_dev_$cls" ]] || continue
+            awk -v ts="$ts" -v g="$idx" -v b="$bdf" -v r="$role" -v c="$cls" \
+                '$2 + 0 > 0 {
+                     printf "%s,%s,%s,%s,%s,%s,%s\n", ts, g, b, r, c, $1, $2
+                 }' "$base/aer_dev_$cls" >> "$AER_UNCORR"
+        done
     done <<< "$targets"
 }
 
@@ -289,7 +391,32 @@ if [[ $WITH_AER -eq 1 ]]; then
             for f in $AER_FIELDS; do printf ',%s' "$f"; done
             printf '\n'
         } > "$AER"
+        echo "timestamp,gpu,bdf,role,class,field,count" > "$AER_UNCORR"
+
+        # Full baseline dump of all three registers, zeros included, so we know
+        # exactly which fields this kernel exposes and where they started.
+        {
+            echo "AER register baseline at $(ts_iso)"
+            echo "(uncorrectable counters are logged sparsely during the run;"
+            echo " this is the complete starting state for reference)"
+            while read -r idx bdf role; do
+                [[ -n "${bdf:-}" ]] || continue
+                echo
+                echo "=== gpu$idx $bdf ($role) ==="
+                for cls in correctable nonfatal fatal; do
+                    f="/sys/bus/pci/devices/$bdf/aer_dev_$cls"
+                    if [[ -r "$f" ]]; then
+                        echo "--- $cls ---"
+                        cat "$f"
+                    else
+                        echo "--- $cls: not readable ---"
+                    fi
+                done
+            done <<< "$AER_TARGETS"
+        } > "$AER_BASE" 2>&1
+
         say "polling AER counters every ${AER_INTERVAL}s -> $AER"
+        say "  uncorrectable (incl. SDES/Surprise-Down) -> $AER_UNCORR"
         (
             while :; do
                 aer_snapshot "$AER_TARGETS" "$AER"
@@ -466,6 +593,7 @@ fi
 # during the load window, which you check against the timestamps in the trace.
 LINK_NOTE=0
 AER_NONZERO=0
+AER_UNCORR_HIT=0
 if [[ -s "$NVML" ]]; then
     awk -F',' '
         NR > 1 && NF >= 8 {
@@ -522,6 +650,13 @@ if [[ $WITH_AER -eq 1 && -n "$AER_TARGETS" ]]; then
             AER_NONZERO=1
         fi
     fi
+
+    # Any uncorrectable row at all is significant — these are zero on a healthy
+    # link, and the field name identifies the actual fatal error.
+    if [[ -s "$AER_UNCORR" ]] \
+       && awk -F',' 'NR > 1 { f = 1 } END { exit !f }' "$AER_UNCORR" 2>/dev/null; then
+        AER_UNCORR_HIT=1
+    fi
 fi
 
 # PSU current summary. The headline figures are peak per-supply load against the
@@ -563,9 +698,22 @@ if [[ $WITH_PSU -eq 1 && -s "$PSUCSV" ]]; then
         }' "$PSUCSV" > "$PSUSUM" 2>/dev/null || true
 fi
 
+# Re-read the root-port link state after the run. A link that was at capability
+# before and is below it after is a much stronger signal than either reading alone.
+if [[ -x "$HERE/linkcheck.sh" ]]; then
+    "$HERE/linkcheck.sh" > "$RUNDIR/pcie_link_rootports_after.txt" 2>&1 || true
+    if [[ -s "$ROOTPORT_LINK" && -s "$RUNDIR/pcie_link_rootports_after.txt" ]] \
+       && ! diff -q "$ROOTPORT_LINK" "$RUNDIR/pcie_link_rootports_after.txt" >/dev/null 2>&1; then
+        say "  *** root-port link state CHANGED across this run ***"
+        diff "$ROOTPORT_LINK" "$RUNDIR/pcie_link_rootports_after.txt" 2>/dev/null \
+            | while IFS= read -r l; do say "      $l"; done
+    fi
+fi
+
 {
     echo
     echo "end_utc           : $(ts_iso)"
+    echo "uptime_at_end_s   : $(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)"
     echo "exit_code         : $RC"
     case "$RC" in
         0) echo "verdict           : clean" ;;
@@ -585,6 +733,27 @@ if [[ -s "$PSUSUM" ]]; then
     say "  psu_current.csv / psu_summary.txt  per-PSU output current:"
     while IFS= read -r l; do [[ -n "$l" ]] && say "      $l"; done < "$PSUSUM"
 fi
+if [[ $AER_UNCORR_HIT -eq 1 ]]; then
+    say "  *** UNCORRECTABLE AER recorded — this names the fatal error ***"
+    awk -F',' 'NR > 1 {
+        k = $2 "|" $3 "|" $4 "|" $5 "|" $6
+        if (!(k in seen)) { seen[k] = 1; order[++n] = k }
+        last[k] = $7
+    } END {
+        for (i = 1; i <= n; i++) {
+            split(order[i], p, "|")
+            printf "gpu%s %s (%s)  %s.%s = %s\n", p[1], p[2], p[3], p[4], p[5], last[order[i]]
+        }
+    }' "$AER_UNCORR" 2>/dev/null | while IFS= read -r l; do say "      $l"; done
+    if grep -q ',SDES,' "$AER_UNCORR" 2>/dev/null; then
+        say "      SDES = Surprise Down Error: the link dropped unexpectedly,"
+        say "      i.e. the device stopped responding rather than degrading and"
+        say "      then signalling ERR_FATAL over a working link."
+    else
+        say "      No SDES (Surprise Down) — consistent with a link that degraded"
+        say "      and reported a fatal error, not one that vanished."
+    fi
+fi
 if [[ -s "$AERDELTA" ]]; then
     say "  aer_counters.csv / aer_delta.txt  per-link AER accumulation:"
     while IFS= read -r l; do say "      $l"; done < "$AERDELTA"
@@ -595,8 +764,9 @@ fi
 if [[ -s "$LINKSTATES" ]]; then
     say "  pcie_link_states.txt  distinct PCIe link states observed"
     if [[ $LINK_NOTE -eq 1 ]]; then
-        say "    note: at least one sample below Gen5 x16 — expected while idle,"
-        say "    significant if it falls inside the load window:"
+        say "    note: at least one sample below Gen5 x16. ASPM is disabled on"
+        say "    this platform's root ports, so this is NOT normal power saving —"
+        say "    check the timestamps to see whether it falls inside the load window:"
         while IFS= read -r l; do say "      $l"; done < "$LINKSTATES"
     fi
 fi

@@ -308,10 +308,19 @@ static double collBwFactor(Collective c, int nranks)
     }
 }
 
-// This fleet has PCIe P2P disabled entirely (every pair reports CNS), so NCCL
-// stages every transfer through host RAM. Each remote byte therefore crosses
-// PCIe twice — up the sender's link into host memory, then down the receiver's.
-// For one rank that means its own link carries both its egress and its ingress.
+// A rank's own PCIe link carries both its egress and its ingress, so per-rank
+// link bytes are twice the one-directional algorithmic figure.
+//
+// This factor is topology-independent, which is worth stating because the
+// reasoning behind it is often given in fleet-specific terms. Where P2P is
+// disabled (every pair CNS, as on the riser-based nodes) NCCL stages through
+// host RAM: the rank writes up its own link and reads back down it. Where a PCIe
+// switch allows direct peer access, the rank sends down its link to a peer and
+// receives from peers over the same link. Either way its own link sees egress
+// plus ingress.
+//
+// What DOES change with topology is traffic on the shared upstream link above a
+// switch, and host DRAM traffic — neither of which this figure describes.
 static const double PCIE_HOST_STAGING_MULT = 2.0;
 
 // PCIe Gen5 x16: 32 GT/s per lane x 16 lanes x 128b/130b ~= 63 GB/s per
@@ -338,6 +347,12 @@ struct Config {
     // correlated current steps across 8 cards are part of the mechanism.
     double rankStaggerMs  = 0.0;
     bool alwaysTensor     = false;
+    // Never set tensor-op math mode. Needed to build a gpu-burn-equivalent arm:
+    // gpu-burn leaves cuBLAS at CUBLAS_DEFAULT_MATH unless -tc is passed, so its
+    // FP32 GEMMs run on the CUDA cores. Without this flag pcieburn always
+    // engages tensor cores at the halfway mark, which makes a true
+    // like-for-like comparison against gpu-burn impossible.
+    bool noTensor         = false;
     bool doCompare        = true;
     double collTimeout    = 120.0;     // in-rank stream poll timeout, 0 = off
     double watchdog       = 60.0;      // supervisor silence timeout, 0 = off
@@ -705,7 +720,7 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
     cublasHandle_t cub = nullptr;
     CUBLAS_CHECK(cublasCreate(&cub));
     CUBLAS_CHECK(cublasSetStream(cub, stream));
-    if (cfg.alwaysTensor)
+    if (cfg.alwaysTensor && !cfg.noTensor)
         CUBLAS_CHECK(cublasSetMathMode(cub, PCIEBURN_TENSOR_MATH));
 
     // --- NCCL buffers and comm come FIRST ------------------------------------
@@ -976,7 +991,8 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
 
             // DCGM pulls in tensor cores at the halfway mark rather than from
             // the start; mirror that so the thermal/power ramp matches a diag run.
-            if (!hintedTensorCores && elapsed > cfg.duration / 2.0) {
+            if (!cfg.noTensor && !hintedTensorCores &&
+                elapsed > cfg.duration / 2.0) {
                 hintedTensorCores = true;
                 CUBLAS_CHECK(cublasSetMathMode(cub, PCIEBURN_TENSOR_MATH));
                 logf_("enabled tensor-op math mode at %.1fs", elapsed);
@@ -1102,6 +1118,11 @@ static void usage(const char *argv0)
 "                        Use it to test whether correlated current steps across\n"
 "                        all GPUs are part of the failure mechanism.\n"
 "  --always-tensor       enable tensor-op math from the start, not at halfway\n"
+"  --no-tensor           never enable tensor-op math. Use with --precision\n"
+"                        single --matrix-dim 8192 to build a gpu-burn-equivalent\n"
+"                        arm: gpu-burn leaves cuBLAS at CUBLAS_DEFAULT_MATH and\n"
+"                        uses 8192-dim FP32 GEMMs, which dispatch ~65x fewer\n"
+"                        kernels per second than the 2048-dim default.\n"
 "  --no-compare          skip result verification (pure load)\n"
 "  --coll-timeout SEC    per-rank hang timeout (default 120, 0 = off)\n"
 "  --watchdog SEC        supervisor silence timeout (default 60, 0 = off)\n"
@@ -1222,6 +1243,8 @@ static bool parseArgs(int argc, char **argv, Config &cfg)
             }
         } else if (!strcmp(a, "--always-tensor")) {
             cfg.alwaysTensor = true;
+        } else if (!strcmp(a, "--no-tensor")) {
+            cfg.noTensor = true;
         } else if (!strcmp(a, "--no-compare")) {
             cfg.doCompare = false;
         } else if (!strcmp(a, "--coll-timeout")) {
@@ -1272,6 +1295,10 @@ static bool parseArgs(int argc, char **argv, Config &cfg)
     if (cfg.matrixDim % 8 != 0) {
         fprintf(stderr, "--matrix-dim must be a multiple of 8 (got %u)\n",
                 cfg.matrixDim);
+        return false;
+    }
+    if (cfg.noTensor && cfg.alwaysTensor) {
+        fprintf(stderr, "--no-tensor and --always-tensor are contradictory\n");
         return false;
     }
     if (cfg.memFrac <= 0.0 || cfg.memFrac >= 1.0) {
@@ -1454,6 +1481,9 @@ int main(int argc, char **argv)
         logf_("  duration=%.0fs matrix_dim=%u precision=%s stream=%s",
               cfg.duration, cfg.matrixDim, precList.c_str(),
               cfg.explicitStream ? "explicit" : "legacy");
+        if (cfg.noTensor)
+            logf_("  tensor-op math DISABLED for the whole run "
+                  "(gpu-burn-equivalent math mode)");
         if (cfg.rankStaggerMs > 0.0)
             logf_("  rank_stagger=%.2fms per rank (power transients "
                   "DE-CORRELATED — diagnostic mode, less faithful than "
