@@ -26,13 +26,36 @@ Consequently **every hypothesis below is untested**, including ones earlier
 rounds appeared to exclude. Prior indications are recorded only so the same
 ground is not re-covered blindly, never as evidence.
 
-### Open item
+### Binary identity is carried in the run tag
 
 The manifest records the *source* commit but nothing verifies the **binary** was
-built from it. `pcieburn` is untracked, so two nodes can sit on identical commits
-and run different binaries with nothing in the artifacts revealing it. A
-`sha256sum` of the binary in the manifest closes this. Until then, binary
-identity must be checked by hand before any comparison set.
+built from it — `pcieburn` is untracked, so two nodes can sit on identical commits
+and run different binaries. Rather than change frozen code, both identities go in
+the tag, where they land in the run directory name and the `events.csv` tag
+column:
+
+```sh
+BIN=./pcieburn
+TAG="$(hostname)-pl575-g$(git rev-parse --short=7 HEAD)-b$(sha256sum "$BIN" | cut -c1-8)"
+```
+
+Read the pair together:
+
+| both match across nodes | fully comparable |
+|---|---|
+| git matches, binary differs | source identical, **toolchain or build path differs** |
+| git differs | source differs — invalid, stop |
+
+The middle row is why both are needed. A binary-hash mismatch does **not** by
+itself mean the code differs: `nvcc -lineinfo` embeds source paths, and a
+different CUDA patch level yields a different binary from identical source. The
+hash is asymmetric — a match is a strong guarantee, a mismatch means investigate.
+
+Two things to watch. Hash the binary the wrapper will actually run: it honours
+`PCIEBURN_BIN`, so hashing `./pcieburn` while it executes something else puts a
+truthful-looking but wrong hash in the tag. And the manifest records the driver
+version but **not the CUDA toolkit version**, so a toolchain difference is
+otherwise invisible — capture `nvcc --version | tail -1` per node once at setup.
 
 ---
 
@@ -118,12 +141,16 @@ Observed times-to-fault, pre-freeze and therefore indicative only: 77, 117, 178,
 ## Experimental protocol
 
 1. **Verify identical commit *and* binary hash on every node** before a
-   comparison set. This is the failure that cost a full round.
+   comparison set. This is the failure that cost a full round. Both are carried
+   in the run tag (see above); the manifest independently records the full
+   commit:
    ```sh
    for d in runs/*/; do printf '%-46s %s\n' "$(basename $d)" \
      "$(sed -n '/--- git ---/{n;p;q}' $d/manifest.txt)"; done | sort -k2
    ```
-   Anything that does not group by one hash is not comparable.
+   Anything that does not group by one hash is not comparable. Tags whose `-g`
+   parts match but whose `-b` parts differ mean the toolchain diverged, not the
+   source.
 2. **Duration ≥300 s, prefer 600 s.** A 180 s run straddled a real 178 s fault,
    and a 60 s run passed 13 minutes before a 117 s fault on the same machine.
    A clean run shorter than ~2× the longest observed time-to-fault is not
