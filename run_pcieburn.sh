@@ -261,6 +261,10 @@ fi
 capture_kernel_log() {
     local out="$1"
     if dmesg --ctime > "$out" 2>/dev/null && [[ -s "$out" ]]; then return 0; fi
+    # Only dmesg needs privilege here; the redirect is deliberately performed by
+    # the caller so "$out" stays owned by the invoking user and the run directory
+    # remains readable without sudo. SC2024 flags the pattern generically.
+    # shellcheck disable=SC2024
     if sudo -n dmesg --ctime > "$out" 2>/dev/null && [[ -s "$out" ]]; then return 0; fi
     if journalctl -k --no-pager -o short-precise > "$out" 2>/dev/null \
        && [[ -s "$out" ]]; then return 0; fi
@@ -621,31 +625,35 @@ fi
 if [[ $WITH_AER -eq 1 && -n "$AER_TARGETS" ]]; then
     aer_snapshot "$AER_TARGETS" "$AER" || true   # final sample closes the window
     if [[ -s "$AER" ]]; then
+        # All eight correctable fields, not just the first five. Printing only
+        # RxErr..Timeout hid a real signal once: on a switched node every trunk
+        # port recorded NonFatalErr=1 while showing zero in the printed columns,
+        # which read as "the upstream fabric is clean" when it was not.
         awk -F',' 'NR > 1 {
             k = $4 "|" $2 "|" $3
             if (!(k in seen)) {
                 seen[k] = 1; order[++n] = k
-                f5[k]=$5+0; f6[k]=$6+0; f7[k]=$7+0; f8[k]=$8+0; f9[k]=$9+0
+                for (i = 5; i <= 12; i++) f[k, i] = $i + 0
             }
-            l5[k]=$5+0; l6[k]=$6+0; l7[k]=$7+0; l8[k]=$8+0; l9[k]=$9+0
+            for (i = 5; i <= 12; i++) l[k, i] = $i + 0
         } END {
-            for (i = 1; i <= n; i++) {
-                k = order[i]; split(k, p, "|")
-                printf "%-8s %-3s %-12s %6d %7d %8d %9d %8d\n",
-                    p[1], p[2], p[3],
-                    l5[k]-f5[k], l6[k]-f6[k], l7[k]-f7[k],
-                    l8[k]-f8[k], l9[k]-f9[k]
+            for (j = 1; j <= n; j++) {
+                k = order[j]; split(k, p, "|")
+                printf "%-8s %-3s %-14s", p[1], p[2], p[3]
+                for (i = 5; i <= 12; i++) printf " %8d", l[k, i] - f[k, i]
+                printf "\n"
             }
         }' "$AER" 2>/dev/null | sort -k7 -nr > "$RUNDIR/.aer_body" || true
 
         {
-            printf '%-8s %-3s %-12s %6s %7s %8s %9s %8s\n' \
-                role gpu bdf RxErr BadTLP BadDLLP Rollover Timeout
+            printf '%-8s %-3s %-14s %8s %8s %8s %8s %8s %8s %8s %8s\n' \
+                role gpu bdf RxErr BadTLP BadDLLP Rollover Timeout \
+                NonFatalErr CorrIntErr HeaderOF
             cat "$RUNDIR/.aer_body"
         } > "$AERDELTA"
         rm -f "$RUNDIR/.aer_body"
 
-        if awk 'NR > 1 { for (i = 4; i <= 8; i++) if ($i + 0 > 0) { f = 1 } }
+        if awk 'NR > 1 { for (i = 4; i <= 11; i++) if ($i + 0 > 0) { f = 1 } }
                 END { exit !f }' "$AERDELTA" 2>/dev/null; then
             AER_NONZERO=1
         fi
