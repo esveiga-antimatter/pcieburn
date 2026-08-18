@@ -261,6 +261,10 @@ fi
 capture_kernel_log() {
     local out="$1"
     if dmesg --ctime > "$out" 2>/dev/null && [[ -s "$out" ]]; then return 0; fi
+    # Only dmesg needs privilege here; the redirect is deliberately performed by
+    # the caller so "$out" stays owned by the invoking user and the run directory
+    # remains readable without sudo. SC2024 flags the pattern generically.
+    # shellcheck disable=SC2024
     if sudo -n dmesg --ctime > "$out" 2>/dev/null && [[ -s "$out" ]]; then return 0; fi
     if journalctl -k --no-pager -o short-precise > "$out" 2>/dev/null \
        && [[ -s "$out" ]]; then return 0; fi
