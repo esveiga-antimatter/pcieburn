@@ -191,6 +191,13 @@ say "uptime at start: $UPTIME_H (booted $BOOT_UTC)"
         || nvidia-smi -q -d POWER 2>&1 | grep -iE 'GPU 0000|Power Limit' \
         || true
     echo
+    echo "--- GPU clocks (a locked clock via -lgc is a run variable, and the tag"
+    echo "    is the only other place it is recorded; the 100ms NVML trace shows"
+    echo "    empirically whether SM clock is pinned or still free-running) ---"
+    nvidia-smi -q -d CLOCK 2>&1 \
+        | grep -E '^GPU |Clocks|^ +(Graphics|SM|Memory|Video) ' | head -60 \
+        || true
+    echo
     echo "--- PCIe link capability vs current, via NVML (baseline before load) ---"
     nvidia-smi --query-gpu=index,pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current \
         --format=csv 2>&1 || true
@@ -279,6 +286,24 @@ if ! capture_kernel_log "$RUNDIR/dmesg_before.txt"; then
     say "         Fix with: sudo sysctl kernel.dmesg_restrict=0"
 fi
 DMESG_BEFORE_LINES=$(wc -l < "$RUNDIR/dmesg_before.txt")
+
+# PCIe error ownership, recorded because it is now a variable across this fleet.
+# Whether firmware or the OS owns AER decides whether uncorrectable-AER sampling
+# can see anything at all: under firmware-first the platform reads and clears
+# those registers, so aer_uncorrectable.csv comes out structurally empty rather
+# than genuinely clean. It also governs whether DPC contains a fault or the link
+# simply drops.
+{
+    echo
+    echo "--- PCIe error ownership (_OSC negotiation) ---"
+    grep -E '_OSC.*(does not support|OS now controls)' \
+        "$RUNDIR/dmesg_before.txt" 2>/dev/null \
+        | sed 's/^\[[^]]*\] //' | sort -u | head -6
+    printf 'dpc_ports_enabled : %s\n' \
+        "$(grep -c 'DPC: enabled' "$RUNDIR/dmesg_before.txt" 2>/dev/null || echo 0)"
+    printf 'ghes_records_boot : %s\n' \
+        "$(grep -c 'Hardware Error' "$RUNDIR/dmesg_before.txt" 2>/dev/null || echo 0)"
+} >> "$MANIFEST"
 
 # --- optional NVML trace --------------------------------------------------
 NVML_PID=""

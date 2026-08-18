@@ -876,7 +876,6 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
     long long outerIter     = 0;
     long long cumGemms = 0, cumColls = 0, cumFaulty = 0, cumNans = 0;
     long long cumCollBytes  = 0;
-    double lastReport       = 0.0;
     bool hintedTensorCores  = cfg.alwaysTensor;
     bool stopping           = false;
 
@@ -1001,9 +1000,15 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
             if (agreedStop)
                 stopping = true;
 
-            const double nowT = nowSec();
-            if (stopping || nowT - lastReport >= cfg.reportInterval) {
-                lastReport = nowT;
+            // Emit a record for EVERY pass. --report-interval used to gate this,
+            // which throttled the event log as well as the console and therefore
+            // under-sampled whichever precision aliased against the interval —
+            // one real run logged 2473 half passes and zero single passes across
+            // 1800s, making the throughput series look like a machine
+            // difference when it was a sampling artifact. The log is for
+            // analysis and must be complete; the console is throttled by the
+            // supervisor instead. Volume is trivial: ~1.6 passes/s/rank.
+            {
                 msgInit(&msg, rank, MSG_PROGRESS);
                 msg.precision = (int32_t)prec;
                 msg.outerIter = outerIter;
@@ -1126,7 +1131,10 @@ static void usage(const char *argv0)
 "  --no-compare          skip result verification (pure load)\n"
 "  --coll-timeout SEC    per-rank hang timeout (default 120, 0 = off)\n"
 "  --watchdog SEC        supervisor silence timeout (default 60, 0 = off)\n"
-"  --report-interval SEC progress cadence (default 1.0)\n"
+"  --report-interval SEC CONSOLE progress cadence (default 1.0). The event\n"
+"                        log always records every pass regardless, so the\n"
+"                        CSV is a complete record and one precision cannot\n"
+"                        be under-sampled by interval aliasing.\n"
 "  --event-log PATH      append a CSV event log for telemetry correlation\n"
 "  --tag NAME            label recorded in the event log\n"
 "  -h, --help            this message\n"
@@ -1360,6 +1368,8 @@ struct RankState {
     bool  done      = false;
     bool  failed    = false;
     double lastSeen = 0.0;
+    double lastConsole = 0.0;   // console rate-limit only; the event log is
+                                // always written, so the CSV stays complete
     RankMsg last {};   // zero-init: the final summary reads this even for a
                        // rank that died before its first report
     // Peak GEMM throughput per precision. Tracked separately because half and
@@ -1724,12 +1734,16 @@ int main(int argc, char **argv)
                 break;
 
             case MSG_PROGRESS:
+                // Console is rate-limited per rank; the event log never is.
+                if (now - ranks[r].lastConsole >= cfg.reportInterval) {
+                    ranks[r].lastConsole = now;
                 logf_("rank %d iter=%lld %s gemms=%lld colls=%lld "
                       "moved=%.1fGiB %.0f GFLOP/s faulty=%lld nan=%lld",
                       r, (long long)m.outerIter, m.text, (long long)m.gemms,
                       (long long)m.colls,
                       (double)m.collBytes / 1073741824.0, m.gflops,
                       (long long)m.faulty, (long long)m.nans);
+                }
                 eventLogWrite(cfg, "progress", r, &m, m.text);
                 if (m.precision >= 0 && m.precision < 3 &&
                     m.gflops > ranks[r].peakGflops[m.precision])

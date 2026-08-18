@@ -11,6 +11,7 @@ and `nccl-tests` (which moves data and barely touches compute).
 | `run_pcieburn.sh` | Run wrapper: safety gate, provenance, telemetry, orphan-free cleanup |
 | `linkcheck.sh` | **Zero-cost PCIe link health screen — no load, safe on any node, usable as a fleet sweep** |
 | `plot_run.gp` | Interactive gnuplot explorer for a run directory (`PNG=1` writes image files) |
+| `../dataviz/` | Separate repo: multi-run explorer — overlay up to 4 runs, hover for values, oscilloscope cursors, zoom to area |
 
 If you are triaging a node rather than stress-testing one, start with
 `linkcheck.sh`. It needs no CUDA, applies no load, and on this fleet it has
@@ -531,6 +532,35 @@ Note on #2: `--rank-stagger` is **deliberately less faithful**. Real
 tensor-parallel inference genuinely is synchronized, so a stagger is a diagnostic
 manipulation, not a fix. If it helps, the remedy is electrical or platform-level,
 not software.
+
+## Comparing runs — the `dataviz` repo
+
+`plot_run.gp` above shows one run at a time. To put **several** runs on one time
+axis — with a value readout under the pointer, draggable oscilloscope cursors and
+a delta between them, and zoom to an arbitrary region — use the separate
+`dataviz` repo, normally checked out alongside this one:
+
+```
+../dataviz/runviz --preset "Fault forensics" runs/<a> runs/<b> --xmode fault
+../dataviz/runviz --list                       # inventory runs/
+../dataviz/runviz --png /tmp/run.png ...       # no display needed
+```
+
+It finds `runs/` on its own (or takes `--root` / `$PCIEBURN_RUNS`). Its
+`--xmode fault` puts each run's `rank_lost` event at t=0, which is what makes two
+reproductions' final seconds directly comparable.
+
+It is a separate repo on purpose: this one is a CUDA harness that has to build and
+run on a GPU node, that one is pure Python that runs on a laptop against
+copied-off artefacts. They share no code and no build.
+
+Worth knowing when reading its output: it **blanks** NVML `power`/`clock`/`temp`
+from the moment a GPU's link width stops reading as a number, because those fields
+keep returning their last value indefinitely after a GPU falls off the bus. It
+takes that onset from the first non-numeric width rather than the first
+`[GPU is lost]` — in the cptrgca17 reproduction the frozen values start 420 ms
+earlier than that string appears. See `../dataviz/README.md` for the full list of
+things it refuses to draw.
 
 ## Safety
 
