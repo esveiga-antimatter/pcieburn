@@ -310,6 +310,75 @@ coherent-peak coincidence, and is not yet supported as a general mechanism.
 ---
 
 
+## Production fidelity: what the served vLLM workload actually looks like
+
+Supplied by the application team for all five served models. Megatron tensor
+parallelism all-reduces the activation tensor twice per layer (post-attention,
+post-MLP), per token; the message is `tokens_in_step x hidden x 2 B` and is
+independent of TP degree. `vllm_shape.py` in this repo reproduces the table.
+
+| model | TP | all-reduces/step | decode msg | decode GEMM sq-equiv | prefill msg | prefill GEMM sq-equiv |
+|---|---|---|---|---|---|---|
+| gemma-4-26b | 2 | 60 | 352 KiB | 633 | 88 MiB | 4020 |
+| gemma-4-31b | 2 | 120 | 672 KiB | 974 | 168 MiB | 6186 |
+| qwen3.6-27b | 2 | 128 | 640 KiB | 943 | 160 MiB | 5988 |
+| qwen3.6-35b | 2 | 80 | 256 KiB | 512 | 64 MiB | 3251 |
+| gpt-oss-20b | 1 | **0** | — | — | — | — |
+
+Batch size is bimodal, not a single number: decode runs ~1 token per live
+sequence (`max-num-seqs=64`), prefill fills toward `max-num-batched-tokens=16384`.
+"GEMM sq-equiv" is the N of an NxN pcieburn GEMM with the same FLOP count as the
+real `[tokens, hidden] x [hidden, hidden/TP]` projection.
+
+**Three things this settles.**
+
+*Our collective size is accidentally right for prefill.* `--coll-min 128M` was
+chosen from `nccl-tests` convention, and real prefill all-reduces are 64–168 MiB.
+The 8192 arm is a prefill-shaped workload in message size.
+
+*But `--matrix-dim 8192` overshoots.* Real prefill GEMMs are 3251–6186
+square-equivalent, so **4096 is the production-representative dimension** and 8192
+is at or beyond the largest real prefill GEMM. The DCGM default of 2048 sits
+between decode (512–974) and prefill.
+
+*The real mismatch is synchronisation rate, not size.* Measured in the 8192 arm:
+**94 GEMMs between consecutive collectives**. Production does **2–3** (QKV +
+output projection, then up/gate + down). We are therefore 30–47x too infrequent in
+how often the ranks are forced into lockstep — and lockstep is the axis hypothesis
+9 is about. Decode is worse still: at 20–50 steps/s the bigger models run
+2,400–12,800 all-reduces/s and move 0.42–4.19 GB/s egress/rank, against our
+measured 0.50 GB/s.
+
+**Arms this makes available with existing flags** (regime pinned, `--no-tensor`):
+
+| arm | flags |
+|---|---|
+| prefill-faithful | `--matrix-dim 4096 --coll-min 64M --coll-max 168M --gemms-per-coll 2` |
+| decode-faithful | `--matrix-dim 1024 --coll-min 256K --coll-max 1M --gemms-per-coll 2` |
+| true TP2 domain | `--gpus 4,5` (the pair holding cor04's susceptible GPU5) |
+
+The TP2 arm matters because production runs **four independent 2-GPU lockstep
+domains**, not one 8-way domain. pcieburn currently makes all eight coherent,
+which overstates production on the coherent-amplitude axis while understating it
+on sync rate. `--gpus` reduces the domain to a faithful TP2 pair without touching
+the code.
+
+**What still cannot be modelled without unfreezing the code.** The application
+team's own view is that the prefill<->decode alternation is the most relevant
+feature, and pcieburn holds one matrix dimension and one collective size for a
+whole run. Representing it needs a duty-cycled alternation between two
+`(matrix_dim, coll_size, gemms_per_coll)` regimes. If that is added, it should be
+a new optional flag whose absence leaves the existing code path bit-identical, so
+the seven arms already recorded here stay comparable.
+
+**One free observation worth more than any run we can do.** `gpt-oss-20b` is
+served TP1 and performs **zero** collectives — no cross-GPU synchronisation at
+all. If this fault has ever occurred on a node serving only gpt-oss, then
+synchronisation is not necessary for it and hypothesis 9 is dead without spending
+a single test run. Ask before building the arms above.
+
+---
+
 ## Hypothesis ledger
 
 Status is post-freeze evidence only. "Prior indication" columns from the
