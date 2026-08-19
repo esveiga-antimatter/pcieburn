@@ -424,6 +424,7 @@ scratched rounds have been dropped where real data now exists.
 | 8 | **PHY/SerDes margin falls as cap clipping rises** (term C). | **Partly supported, and the original framing was wrong.** The 694k-error run was *not* clean (fault 5), so a lower cap does not buy fatal-margin — it buys more correctables *and* still faults. Clipping fraction tracks the error count on rgca18 (47% / 694k vs 35% / 1.8k), but rgca17 clipped 46% with zero errors while running x8, so term A gates it. | `-pl 400` on a reset rgca18: predicts still more correctables and still a fatal |
 | 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
 | 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | hivenet reported zero servers down over 28 days; the fault corpus is entirely `tenant: fal` baremetal. Both tenants share the `cor`, `rgca` and `roca` sites, so site and topology class are *not* the difference. `perfvm_host` membership sets `kernel_iommu: true` → GRUB IOMMU + VFIO, which routes error recovery through `vfio-pci` rather than the NVIDIA RM. We already know `_OSC` AER/DPC ownership varies across this fleet with identical board and BIOS. | Enable IOMMU on a test node via kernel cmdline — no code, no new instrumentation — and re-run a known-reproducing arm. **First, though, resolve the two cheaper questions below: the comparison may be an artifact.** |
+| 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | The waveform is a square wave, not a spike train: unpaced GEMMs run back-to-back so current holds high for the whole burst, and the modulation is at the pass boundary where compute hands over to the collective's DMA. Measured: fundamental 0.57 Hz at full burst, amplitude 193 W/GPU (NVML p2..p98, low state 384 W not idle) = 16.1 A/GPU on 12 V = **129 A coherent, 1.5 kW**. Distinct from hypothesis 9, which is about *coherence across GPUs*; this is about *rate per GPU*. | `--gemms-per-coll` is an edge-rate knob at **fixed amplitude**, which is the clean separation (`--matrix-dim` sets amplitude, `--gemms-per-coll` sets rate). On the 8192 arm: N = 1 / 4 / 16 / 64 / 94 gives 15.4 / 11.0 / 5.1 / 1.6 / 1.1 edges/s — **9,251 vs 686 edges per 600 s run, 13x, at identical amplitude, load and exposure.** If fault rate tracks edge count, transient excitation is implicated; if it tracks exposure regardless of edge count, the mechanism is cumulative/thermal, which is where hypothesis 4 points. Use 8192, not 2048 — the 2048 arm spans only 2x (1.83–4.01 Hz) because `t_coll` swamps `t_gemm`. |
 | 10 | **Per-boot link training outcome sets the link's margin**, independently of workload. | rgca17 GPU6 trained to three different states across three boots (265 s gen1 dwell; clean x16; x8 twice) and its error counts followed the trained state, not the arm. | `linkcheck.sh` at every boot before any load; retrain with `setpci CAP_EXP+10.w=0020:0020` and record whether the state holds. Never compare error counts across boots without recording the trained state. |
 
 
@@ -435,7 +436,10 @@ Observed times-to-fault. Post-freeze, on `933b21f` and therefore usable: **107,
 
 ## How many runs per arm
 
-Computed by `sample_size.py`. The observed calibration is cor04 on `933b21f`:
+Computed by `sample_size.py`. Companion tools: `sync_rate.py` decomposes a run's
+pass into GEMM-window and collective time from `events.csv`; `current_spectrum.py`
+turns that into the modulation-frequency and edge-rate table used by hypothesis 12;
+`vllm_shape.py` maps a tenant serving profile onto the harness's knobs. The observed calibration is cor04 on `933b21f`:
 **4 faults in 2,627 s of load = one fault per 657 s**, which makes the per-600 s-run
 fault probability about **0.60** — not 1.0. That number drives everything below.
 
@@ -667,6 +671,16 @@ degraded one. Width and gen are part of the experimental condition, not backgrou
 running after a rank dies, so a whole-run mean blends load with teardown idle. This
 put one node's per-GPU power at ~400 W against ~520 W for its peers and made the
 victim GPU look like a dramatic outlier; in a matched t=60-105 s window it was +2%.
+
+**Do not infer an edge rate or slew from NVML.** `power.draw` repeats across 3–4
+consecutive 100 ms polls, so the effective update period is ~300–400 ms and Nyquist
+is ~1.5 Hz. The current edge that hypothesis 12 concerns is expected in the
+microsecond range — we are blind to it by a factor of roughly 10⁴. The 193 W
+amplitude figure is a valid *envelope* (a sub-Hz quantity NVML can resolve) and a
+**lower bound** on the true step, since any faster excursion inside the averaging
+window is smoothed away. `dmon` and the BMC are slower still. Measuring the edge
+needs a current probe on the 12 V cables; nothing in the artifact bundle can
+substitute.
 
 **Know your sampler's real resolution before claiming a transient.** NVML repeats
 the same `power.draw` value across 3-4 consecutive 100 ms polls, so its effective
