@@ -310,9 +310,31 @@ coherent-peak coincidence, and is not yet supported as a general mechanism.
 ---
 
 
-## Production fidelity: what the served vLLM workload actually looks like
+## Tenant workload profile: hivenet's vLLM serving
 
-Supplied by the application team for all five served models. Megatron tensor
+**Read the role of this section carefully.** The profile below was supplied by the
+head engineer for the **hivenet** product — and hivenet recorded **zero servers
+down across 28 days**. Meanwhile every node in the fault corpus (`cptcor04`,
+`cptrgca17`, `cptrgca18`) is `tenant: fal`, whose workload is unknown to us and
+deliberately stays that way: the platform has to be reliable regardless of
+workload type, so this investigation does not chase external tenants' internals.
+
+So this is **the profile of the tenant that is not failing.** An arm shaped like it
+is a *negative control*, not a target:
+
+- if a hivenet-shaped arm does **not** reproduce while the adversarial 8192 arm
+  does, that is consistent with hivenet's clean record and tells us the fault
+  needs something this profile lacks;
+- if it **does** reproduce, then hivenet's zero downtime must come from somewhere
+  else — perfVM/IOMMU, different hardware, or monitoring blindness (see
+  hypothesis 11) — because the workload alone would suffice.
+
+Either outcome is informative, which is why it is worth running. What it is *not*
+is a reason to re-centre the harness on this shape. The deliberately adversarial
+arms stay primary, because `fal` could be running anything and the platform must
+survive it.
+
+The numbers, for all five models hivenet serves. Megatron tensor
 parallelism all-reduces the activation tensor twice per layer (post-attention,
 post-MLP), per token; the message is `tokens_in_step x hidden x 2 B` and is
 independent of TP degree. `vllm_shape.py` in this repo reproduces the table.
@@ -349,7 +371,8 @@ how often the ranks are forced into lockstep — and lockstep is the axis hypoth
 2,400–12,800 all-reduces/s and move 0.42–4.19 GB/s egress/rank, against our
 measured 0.50 GB/s.
 
-**Arms this makes available with existing flags** (regime pinned, `--no-tensor`):
+**Control arms this makes available with existing flags** (regime pinned,
+`--no-tensor`):
 
 | arm | flags |
 |---|---|
@@ -400,12 +423,78 @@ scratched rounds have been dropped where real data now exists.
 |---|---|---|---|
 | 8 | **PHY/SerDes margin falls as cap clipping rises** (term C). | **Partly supported, and the original framing was wrong.** The 694k-error run was *not* clean (fault 5), so a lower cap does not buy fatal-margin — it buys more correctables *and* still faults. Clipping fraction tracks the error count on rgca18 (47% / 694k vs 35% / 1.8k), but rgca17 clipped 46% with zero errors while running x8, so term A gates it. | `-pl 400` on a reset rgca18: predicts still more correctables and still a fatal |
 | 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
+| 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | hivenet reported zero servers down over 28 days; the fault corpus is entirely `tenant: fal` baremetal. Both tenants share the `cor`, `rgca` and `roca` sites, so site and topology class are *not* the difference. `perfvm_host` membership sets `kernel_iommu: true` → GRUB IOMMU + VFIO, which routes error recovery through `vfio-pci` rather than the NVIDIA RM. We already know `_OSC` AER/DPC ownership varies across this fleet with identical board and BIOS. | Enable IOMMU on a test node via kernel cmdline — no code, no new instrumentation — and re-run a known-reproducing arm. **First, though, resolve the two cheaper questions below: the comparison may be an artifact.** |
 | 10 | **Per-boot link training outcome sets the link's margin**, independently of workload. | rgca17 GPU6 trained to three different states across three boots (265 s gen1 dwell; clean x16; x8 twice) and its error counts followed the trained state, not the arm. | `linkcheck.sh` at every boot before any load; retrain with `setpci CAP_EXP+10.w=0020:0020` and record whether the state holds. Never compare error counts across boots without recording the trained state. |
 
 
 Observed times-to-fault. Post-freeze, on `933b21f` and therefore usable: **107,
 214, 282, 598 s** (cor04 x3, rgca18 x1). Pre-freeze and indicative only: 77, 117,
 178, 200, 209, 1556 s.
+
+---
+
+## How many runs per arm
+
+Computed by `sample_size.py`. The observed calibration is cor04 on `933b21f`:
+**4 faults in 2,627 s of load = one fault per 657 s**, which makes the per-600 s-run
+fault probability about **0.60** — not 1.0. That number drives everything below.
+
+**A binary screen needs 5 runs per arm, not 3.** Fisher exact, one-sided, two arms
+of n:
+
+| n/arm | perfect separation n/n vs 0/n | one discordant run (n-1)/n vs 0/n |
+|---|---|---|
+| 2 | p = 0.167 | p = 0.500 |
+| 3 | p = 0.050 | p = 0.200 |
+| 5 | **p = 0.004** | **p = 0.024** |
+| 8 | p < 0.001 | p = 0.002 |
+
+n=3 reaches p=0.05 *only* on a perfect split, and one discordant run collapses it
+to 0.20. Since the per-run probability is ~0.60 rather than ~1.0, discordance is
+expected, not exceptional: a destructive arm reads as **completely clean by chance
+6.4% of the time at n=3** (0.4³) versus 1.0% at n=5 (0.4⁵). Five is the smallest
+design that survives one anomalous run.
+
+**But for arms expected to come back clean, duration beats repetition.** Zero
+faults in exposure E bounds the hazard at 3/E:
+
+| plan | exposure | 95% bound on hazard |
+|---|---|---|
+| 3 × 600 s | 1,800 s | < 1 per 600 s |
+| 5 × 600 s | 3,000 s | < 1 per 1,000 s |
+| 1 × 3600 s | 3,600 s | < 1 per 1,200 s |
+| 3 × 3600 s | 10,800 s | **< 1 per 3,600 s** |
+
+Against an observed hazard of one per 657 s, `5 × 600 s` only bounds it 1.5x below
+what we already see — nearly worthless as a clean-arm claim. `3 × 3600 s` bounds it
+5.5x below, for fewer runs of setup overhead.
+
+**For a rate comparison, precision is set by fault count, not run count.** The
+relative standard error of an exponential hazard is 1/sqrt(faults): 4 faults gives
+±50%, 8 gives ±35%, 11 gives ±30%. Detecting a 2x difference between two arms needs
+roughly 8–11 faults each, which at p≈0.6 means **13–18 runs per arm**. Reserve that
+for the two arms that matter most; do not attempt it fleet-wide.
+
+**Replicates are not exchangeable, and this is the same trap as before.** Soak is
+confirmed causal (hypothesis 4), and five back-to-back 600 s runs plus overhead
+span roughly an hour, so replicate index is partly a soak covariate. Do **not** run
+5xA then 5xB. Use randomised blocks: each block contains every arm once, in an
+order that differs per block, so soak drift is spread across arms instead of
+aligned with one.
+
+**Decide the reboot policy explicitly**, because it interacts with hypothesis 10.
+Rebooting between replicates resamples the link-training outcome — correct if you
+want to characterise the *node*, but it adds variance. Not rebooting characterises
+*this boot's configuration* with less variance and narrower validity. Note the
+built-in confound: a fault forces a reboot while a clean run does not, so reboot
+status correlates with outcome unless you reboot before *every* run. Rebooting
+before every run and holding uptime constant (say ~10 min) fixes the soak
+covariate and makes replicates genuinely exchangeable, at the cost of reboot time.
+
+**The recommended default**, then: 5 x 600 s per screening arm in randomised
+blocks, reboot before each run, uptime matched; switch any arm that comes back
+clean to 3 x 3600 s before calling it clean; and spend 13–18 runs only where a rate
+ratio is the actual deliverable.
 
 ---
 
@@ -460,7 +549,10 @@ Observed times-to-fault. Post-freeze, on `933b21f` and therefore usable: **107,
     for minutes, and both silently change the electrical configuration under test —
     rgca17 GPU6 did all three across three boots. Error counts from different
     boots are not comparable without this.
-14. **Log boot_utc per run and group by boot session, not by arm order.** cor04 had
+14. **Run arms in randomised blocks, never n-of-A then n-of-B.** Replicate index
+    carries soak (hypothesis 4) and boot-session link state (hypothesis 10). See
+    [How many runs per arm](#how-many-runs-per-arm) for the sizing.
+15. **Log boot_utc per run and group by boot session, not by arm order.** cor04 had
     four boot sessions across seven arms because its faults forced reboots;
     assuming one boot per node produced a wrong collinearity claim.
 
@@ -605,6 +697,28 @@ the authority on what was applied.
 rise in uptime across a run series looked like continuous soak; the runs spanned
 four boots, and the fitted threshold extrapolated from them was refuted by the
 first point outside the fitted range.
+
+**"No servers were down" is not "no faults occurred."** On baremetal this fault
+produces `Xid 154 — Node Reboot Required` and the node needs rebooting, so it
+registers as downtime. Under GPU passthrough, containment fires at the *host* root
+port and can take out the guest while the host stays up — invisible to any monitor
+keyed on host availability. Ask for the fault signature, not the availability
+figure.
+
+**A `vfio-pci` host emits no `Xid` lines at all.** With GPUs bound to VFIO for
+passthrough there is no NVIDIA driver loaded for them on the host, so `Xid`, `NVRM`
+and "GPU has fallen off the bus" cannot appear in the host log by construction —
+only `pcieport ... DPC: containment event` and AER lines do. A fleet-wide scrape for
+`Xid` will return zero from every passthrough host whether or not the fault fired.
+Search for the `pcieport` signatures instead.
+
+**Check which tenant or population a supplied workload profile describes before
+treating it as representative.** A detailed vLLM serving profile arrived and was
+initially written up as "production fidelity" for the failing nodes. It was the
+profile of the tenant with *zero* incidents, while every node in the fault corpus
+belongs to a different tenant whose workload is unknown. That inverts the profile's
+role from target to negative control, and inverts what a reproduction on it would
+mean.
 
 **State plainly which of your own claims a new result withdraws.** Several
 conclusions here were superseded, and the value of the ledger depends on old
