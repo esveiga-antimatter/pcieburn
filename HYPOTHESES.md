@@ -360,6 +360,89 @@ check): the only anomalous gen1 dwell in all 27 runs (gpu6, 2,655 samples =
 clean-x16 boots produce small episodic counts (9–553). Nothing else in the
 corpus predicts rgca17's error volume.
 
+### Bayesian model comparison (26 runs, `bayes_models.py`)
+
+Constant-hazard survival models fitted to every usable run (7 fault events,
+including rgca18's post-window fault at ~609 s; the rgca18 setup-error run is
+excluded): `lambda = exp(a_node + bP*(W-450)/50 + bU*ln(up/1000) + bW*wear)`.
+Flat priors over declared grids; marginal likelihoods, so every extra parameter
+pays an automatic Occam penalty — this is the quantitative guard against
+unfalsifiable factor-stacking: a factor stays in the model only if it buys more
+likelihood than its prior spread costs.
+
+| model | lnBF vs best | MAP |
+|---|---|---|
+| slot x power | 0.00 | hazard x2.1 per +50 W |
+| slot x power x soak | −0.63 | bU = +0.25 |
+| slot x power x wear | −0.83 | bW = +0.25 |
+| full (P+U+W) | −1.52 | |
+| slot x soak | −2.05 | |
+| slot only | −2.11 | |
+| slot x wear | −3.14 | |
+| no slot term at all | **−4.45** | |
+
+What survives the Occam penalty, in order: **the slot term** (removing it costs a
+factor ~10 even with only three nodes), then **power** (~8x over slot-only,
+hazard roughly doubling per +50 W — the first quantitative estimate of term B).
+**Soak and wear are statistically indistinguishable** (Δ lnBF 0.2) and neither
+currently earns its parameter — the h4 controlled pair is one contrast, and one
+contrast cannot move a marginal likelihood far. That is not evidence against
+soak; it is the measured statement that the corpus's design matrix cannot
+separate soak from wear from campaign time, exactly as h14 says.
+
+Posterior-predictive P(fault in 600 s) for feasible cells, per model — the spread
+across models is the expected information of running that cell:
+
+| cell | slot | +P | +U | +W | +P+U | +P+W | spread |
+|---|---|---|---|---|---|---|---|
+| cor04 soak-1h pl450 (in flight) | .51 | .47 | .59 | .45 | .52 | .63 | 0.18 |
+| rgca17 soak-1h | .02 | .01 | .02 | .02 | .01 | .01 | ~0 |
+| **cor04 baseline-uncapped re-run @ ~700 s uptime** | .51 | .77 | .38 | .45 | .66 | .83 | **0.45** |
+| **cor04 low-power arm (~290 W) @ 1 h uptime** | .51 | .09 | .59 | .45 | .13 | .16 | **0.50** |
+| cor04 deep-soak repeat (~9 h) | .51 | .47 | .83 | .45 | .69 | .63 | 0.38 |
+
+Reading: the **in-flight soak-1h run is the least discriminating cor04 cell**
+(all models roughly agree it faults ~half the time) — its value is mechanism-side
+(h15/h16), not model separation. The two highest-information cheap runs are the
+**baseline-uncapped re-run at matched ~700 s uptime** (soak says 0.38, power+wear
+says 0.83, and TTF adds resolution: soak predicts ≈282 s, wear predicts far less)
+and the **low-power arm at 1 h uptime** (power models say ~0.1, soak says 0.6).
+The h15/h16 2x2 is invisible to all of these models — retrain state and thermal
+history are constant across the whole corpus, so their posteriors are flat and
+each off-diagonal cell is worth close to a full bit. Budget note: at these
+predicted probabilities one run moves lnBF by ~0.5–0.8, so resolving soak-vs-wear
+to "strong" (lnBF ≈ 3) costs **4–6 targeted runs**, consistent with the
+sample-size section. Caveats: constant-hazard within a run is an approximation,
+power is measured rather than assigned, and lnBF differences under ~1 are noise
+at these grid resolutions.
+
+#### Mechanism candidates consistent with h13, ranked by how many confirmed facts each also tracks
+
+1. **Stale Gen5 equalization drifting on the GPU side** — EQ coefficients are set
+   at boot training and typically reused across idle↔load speed changes; the GPU
+   die swings ~60 °C between idle and load while the root port barely moves, so
+   the GPU TX drifts furthest from its coefficients. Tracks h13 + h15 + h10 (per-
+   boot error variance *is* per-boot EQ outcome) + h4. Discriminator already
+   queued: retrain-before-warm-run.
+2. **GPU-local PHY supply disturbance from the card's own load transients** — the
+   TX driver runs off a card-local rail; the host TX does not care about the
+   card's 16 A steps. Tracks h13 + h2, explains SDES-with-no-warning, compatible
+   with h12's refutation (amplitude-driven, not rate-driven). Does not explain
+   soak alone.
+3. **Connector/riser contact degradation on the card-TX pin group** (fretting,
+   driven by thermal-cycle micro-motion) — in the CEM connector the card's TX and
+   RX pairs occupy distinct pin groups, so a systematic mechanical bias degrades
+   one direction fleet-wide. Tracks h13 + h14 + h16 + h7 (different connector
+   systems per topology class). Testable by reseat/swap with Lane Error Status.
+4. **GPU PHY junction heat as a term-B ingredient** — the GPU is the hottest
+   transmitter in the system. Tracks h13 + h2; excluded as sole cause by the 9 h-
+   idle fault and the 438/440 W pair.
+
+**Downgraded by h13:** the symmetric ground-shift story (`edge_bounds.py`) — a
+common-mode shift between GPU and root port displaces both directions about
+equally and both are AC-coupled, so it predicts roughly symmetric errors, not
+700k-to-zero.
+
 ### Corpus audit for further false negatives
 
 All 21 post-freeze runs were audited by scanning each boot session's *last* run's
@@ -539,9 +622,10 @@ scratched rounds have been dropped where real data now exists.
 | 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
 | 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | hivenet reported zero servers down over 28 days; the fault corpus is entirely `tenant: fal` baremetal. Both tenants share the `cor`, `rgca` and `roca` sites, so site and topology class are *not* the difference. `perfvm_host` membership sets `kernel_iommu: true` → GRUB IOMMU + VFIO, which routes error recovery through `vfio-pci` rather than the NVIDIA RM. We already know `_OSC` AER/DPC ownership varies across this fleet with identical board and BIOS. | Enable IOMMU on a test node via kernel cmdline — no code, no new instrumentation — and re-run a known-reproducing arm. **First, though, resolve the two cheaper questions below: the comparison may be an artifact.** |
 | 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | **REFUTED, and this is the investigation's first properly controlled single-factor test.** ~90x more coherent current edges at matched duty cycle and matched PCIe traffic changed time-to-fault by 11% (107 s -> 95 s) on cor04. A transient-count mechanism predicts TTF collapsing toward ~1 s. The arm also overshot power by 9% (541 vs 496 W), so it was *harsher* than the reference and still did not fault meaningfully faster. Together with hypothesis 1 (100x *less* dispatch -> worse), the transient-rate family is now empty in both directions. | Closed. n=1 per arm and exponential TTF gives +/-100% on a single event, so the 11% itself is noise — but the *absence* of a 90x effect is not a subtle inference. Reopen only with a mechanism that survives both refutations. |
-| 13 | **The failing direction is uniformly GPU→upstream (GPU TX / board RX).** The marginal element is on the GPU side of every link: its transmitter, its PHY supply, or the TX pairs of its connector path. | Corpus-wide aggregation of all 27 runs' AER tables: upstream-facing receivers logged **697,865 RxErr / 93,547 BadTLP / 6,274 BadDLLP**; GPU (dev) rows logged **zero** of all three, while logging 959 Rollover — so their AER reporting works and the zero is real. The story is coherent: GPU transmits bad → receiver logs RxErr/BadTLP → GPU replays → GPU Rollover. Sole exception: 58 Rollover on `34:10.0` (downstream TX) in the one bad-training run, 0.008% of the corpus. Both fatal classes fit too: `SDES` = the root port stops hearing the GPU; `ERR_FATAL received from <GPU>` = the GPU reports its own escalation. Also explains the BMC symptom: host-side receivers seeing bad data is what IPMI misreads as PERR/SERR. | On a card/slot swap (h6's test), direction sharpens the interpretation: if errors follow the card, GPU TX PHY or its supply; if they stay with the slot, the slot's RX path or the connector TX pairs. Read-only now: `Lane Error Status` on the three implicated receiving ports localizes which lanes take the hits. |
+| 13 | **The failing direction is uniformly GPU→upstream (GPU TX / board RX).** The marginal element is on the GPU side of every link: its transmitter, its PHY supply, or the TX pairs of its connector path. | Corpus-wide aggregation of all 27 runs' AER tables: upstream-facing receivers logged **697,865 RxErr / 93,547 BadTLP / 6,274 BadDLLP**; GPU (dev) rows logged **zero** of all three, while logging 959 Rollover — so their AER reporting works and the zero is real. The story is coherent: GPU transmits bad → receiver logs RxErr/BadTLP → GPU replays → GPU Rollover. Sole exception: 58 Rollover on `34:10.0` (downstream TX) in the one bad-training run, 0.008% of the corpus. Both fatal classes fit too: `SDES` = the root port stops hearing the GPU; `ERR_FATAL received from <GPU>` = the GPU reports its own escalation. Also explains the BMC symptom: host-side receivers seeing bad data is what IPMI misreads as PERR/SERR. | **First verify the zero is not a mask artifact:** AER correctable masks are per-bit, so a GPU reporting Rollover does not prove RxErr/BadTLP are unmasked — read the `CEMsk:` line via `lspci -vvv` on a GPU. If RxErr is masked there, h13 needs re-grounding. Then: on a card/slot swap (h6's test), direction sharpens the interpretation: if errors follow the card, GPU TX PHY or its supply; if they stay with the slot, the slot's RX path or the connector TX pairs. Read-only now: `Lane Error Status` on the three implicated receiving ports localizes which lanes take the hits. |
 | 14 | **Cumulative wear, not within-boot soak** — repeated faults/containments progressively degrade the marginal slot, and h4's "uptime" is proxying it. | The cap-575 TTF decline on cor04 (282 → 214 → 107 → 95 s) spans **four different boots**, so within-boot uptime, wall-clock campaign time, cumulative fault count (0, 1, 2, 4 prior), and ambient time-of-day all rise together across it — the series cannot distinguish them. Weak counter-evidence: GPU0's BadTLP at pl450 *fell* from 32,275 (early) to 3,954 (late). Ambient is entirely unmeasured. | Cheap and near-decisive: re-run `baseline-uncapped` exactly, at matched ~700 s uptime. Wear predicts TTF ≪ 282 s; soak predicts ≈ 282 s. Also start logging BMC inlet temperature per run — one `ipmitool sdr` read in the wrapper — to kill the ambient confound. |
 | 15 | **The soak variable is idle link-state residency / training age, not time or temperature.** GPUs autonomously downtrain to gen1 while idle; hours of idle-at-gen1 (or a stale training) may be what erodes the link, and retraining may reset it. | The pl450-warm fault (TTF 224 s at 33,347 s uptime) followed **~9 h of idle** — the node was at ambient temperature at load start, so whatever "soak" is, it survives complete thermal relaxation and **cannot be junction/board temperature**. What does persist across 9 h idle: link-training age, idle gen1 residency, driver/GSP state age. | Before a warm run, force a retrain (`setpci CAP_EXP+10.w=0020:0020` on the implicated ports, confirm gen5 x16 via `linkcheck.sh`), then run the arm. TTF back at cold values → training age/residency is the mechanism and a periodic retrain is a cheap fleet mitigation. TTF still short → driver/system state age or wear (h14). |
+| 16 | **Thermal-cycle depth/count, not temperature level** — each cold→hot→cold excursion is one fatigue/fretting cycle; idle time matters as *cycle depth*, not as elapsed time. | Re-explains the 9 h-idle fault as the campaign's deepest thermal relaxation followed by full reheat, and gives h14 a physical mechanism (thermo-mechanical micro-motion → fretting at the connector, whose card-TX pins sit in their own physical group → tracks h13's direction uniformity). Constraints already in hand: fault timing rules out an instantaneous dT/dt trigger (4 of 6 faults landed well after thermal settle), and the h12 pair disfavours per-pass micro-cycling (13.5x more, shallower cycles → Coffin–Manson predicts *less* damage/s, observed TTF unchanged). Run-level ΔT is collinear with power at fixed cooling, so the corpus cannot test this observationally. | The 2x2 that separates h15 from h16 on a long-idled cor04, same arm: {retrain, no-retrain} x {pre-warm 10 min light load, cold start}. h15 predicts retrain rescues regardless of warmth; h16 predicts pre-warming rescues regardless of retrain. Also the cycle-count arm: 6 x 100 s with ~5 min cool-down gaps vs 1 x 600 s at matched cap and total load-seconds. |
 | 10 | **Per-boot link training outcome sets the link's margin**, independently of workload. | rgca17 GPU6 trained to three different states across three boots (265 s gen1 dwell; clean x16; x8 twice) and its error counts followed the trained state, not the arm. | `linkcheck.sh` at every boot before any load; retrain with `setpci CAP_EXP+10.w=0020:0020` and record whether the state holds. Never compare error counts across boots without recording the trained state. |
 
 
