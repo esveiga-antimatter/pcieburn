@@ -304,6 +304,62 @@ runs on the previous boot, with no intervention, and logged zero AER under 29.4%
 Gen5 x16. Its error behaviour tracks per-boot training outcome rather than workload.
 Third independent vote for hypothesis 10.
 
+### Cross-run correlation pass (27 runs, `corr_matrix.py`)
+
+A systematic pass over every artifact bundle — one row per run (matched-window
+power/temp/clipping, collective rate, TTF, per-port AER, link states) — testing
+the ledger's correlations against the whole corpus at once. `corr_matrix.py`
+regenerates the table. Descriptive statistics only: n is small and arms are
+confounded, so the r values rank signals, they do not test them.
+
+**Arms are not node-invariant — a topology-linked confound not previously listed.**
+The byte-identical gpc1 arm (`--gemms-per-coll 1`, default 128M–1G collectives)
+achieved **18.5 GB/s egress/rank on cor04 and 4.6 GB/s on rgca17 — 4.0x slower**
+(21.1 vs 5.2 collectives/s, 284 W vs 153 W). Cause: an 8-way host-staged
+collective funnels every rank's traffic through the switchboard's single shared
+uplink, which saturates; cor04's eight independent root ports do not. The effect
+vanishes for small collectives (coll4M: 54.9 vs 56.9 colls/s) and is mild in
+full-burst arms (collective is ~6% of the pass). **Consequence: any arm whose
+duty cycle is collective-dominated is systematically milder on RGCA nodes, and
+"same arm" claims must be validated against achieved power and collective rate
+per node, not per design.** rgca17's clean gpc1 runs at 153 W say nothing.
+
+**cor04 has two distinct failure modes on its two slots — not one mechanism with
+two victims.**
+
+| slot | correctables across all runs | fault signature | faults |
+|---|---|---|---|
+| GPU0 `00:01.1` | BadTLP in **every** 8192 arm: 32,275 / 3,954 / 922 / 1 | `ERR_FATAL received from 01:00.0` — errors escalate to endpoint fatal | 214 s, 224 s |
+| GPU5 `a0:01.1` | **zero, in all 27 runs** | `SDES` at the root port — sudden loss, no warning of any kind | 282, 107, 95 s |
+
+The one "correctables on the dying port" case in the corpus (pl450-warm) is a
+GPU0 fault — consistent with the split: GPU0 warns and then dies of its warnings;
+GPU5 never warns. Any precursor-based detection can only ever cover the GPU0
+class. Note also GPU0's BadTLP appears **only under the 8192 workload** and scales
+*inversely* with cap (450 W: 32k/4k; 575 W: 1/922) — the term-C inverse-power
+effect survives, but only within this slot.
+
+**Hypothesis 8's clipping metric fails as a general predictor.** Across 26 runs,
+r(clip%, AER) = +0.20 and r(clip%, fault) = +0.03. rgca17 ran the coll4M arm at
+**100% clip (574 W pinned) and stayed clean**; lgc2100 faulted at 0% clip and
+396 W. Clipping fraction is dropped as a stress metric; what remains of h8 is the
+within-slot inverse-power correctable scaling above.
+
+**No pooled uptime→TTF trend: r = +0.02 across the six faults.** The h4 evidence
+remains the controlled pair (438 W clean at 216 s uptime vs 440 W fault at
+33,347 s — power identical to within 2 W), not a dose-response curve. The
+within-boot-family decline (282→214→107→95 s) spans four boots and four arms and
+must not be read as one.
+
+**Victim power rank is confirmed non-predictive** with the full corpus: GPU5 was
+rank 1, 1, and 8 of 8 by power in its three faults; GPU0 rank 6 both times.
+
+**Per-boot training state dominates switch-node error counts** (h10, full-corpus
+check): the only anomalous gen1 dwell in all 27 runs (gpu6, 2,655 samples =
+265 s) belongs to the 10,599-error run; both x8 trainings produced zero errors;
+clean-x16 boots produce small episodic counts (9–553). Nothing else in the
+corpus predicts rgca17's error volume.
+
 ### Corpus audit for further false negatives
 
 All 21 post-freeze runs were audited by scanning each boot session's *last* run's
@@ -479,7 +535,7 @@ scratched rounds have been dropped where real data now exists.
 
 | # | Hypothesis | Basis | Next test |
 |---|---|---|---|
-| 8 | **PHY/SerDes margin falls as cap clipping rises** (term C). | **Partly supported, and the original framing was wrong.** The 694k-error run was *not* clean (fault 5), so a lower cap does not buy fatal-margin — it buys more correctables *and* still faults. Clipping fraction tracks the error count on rgca18 (47% / 694k vs 35% / 1.8k), but rgca17 clipped 46% with zero errors while running x8, so term A gates it. | `-pl 400` on a reset rgca18: predicts still more correctables and still a fatal |
+| 8 | **PHY/SerDes margin falls as cap clipping rises** (term C). | **Downgraded: clipping fraction fails as a general metric** — r(clip%, AER) = +0.20, r(clip%, fault) = +0.03 over 26 runs; rgca17 ran 100% clipped at 574 W clean, lgc2100 faulted at 0% clip. What survives is within-slot: cor04 GPU0's BadTLP scales inversely with cap (450 W: 32k/4k; 575 W: 1/922), and only under the 8192 workload. | If pursued, pursue it per-slot on cor04 GPU0 with cap as the only variable; do not use clipping fraction as a fleet metric. |
 | 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
 | 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | hivenet reported zero servers down over 28 days; the fault corpus is entirely `tenant: fal` baremetal. Both tenants share the `cor`, `rgca` and `roca` sites, so site and topology class are *not* the difference. `perfvm_host` membership sets `kernel_iommu: true` → GRUB IOMMU + VFIO, which routes error recovery through `vfio-pci` rather than the NVIDIA RM. We already know `_OSC` AER/DPC ownership varies across this fleet with identical board and BIOS. | Enable IOMMU on a test node via kernel cmdline — no code, no new instrumentation — and re-run a known-reproducing arm. **First, though, resolve the two cheaper questions below: the comparison may be an artifact.** |
 | 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | **REFUTED, and this is the investigation's first properly controlled single-factor test.** ~90x more coherent current edges at matched duty cycle and matched PCIe traffic changed time-to-fault by 11% (107 s -> 95 s) on cor04. A transient-count mechanism predicts TTF collapsing toward ~1 s. The arm also overshot power by 9% (541 vs 496 W), so it was *harsher* than the reference and still did not fault meaningfully faster. Together with hypothesis 1 (100x *less* dispatch -> worse), the transient-rate family is now empty in both directions. | Closed. n=1 per arm and exponential TTF gives +/-100% on a single event, so the 11% itself is noise — but the *absence* of a 90x effect is not a subtle inference. Reopen only with a mechanism that survives both refutations. |
