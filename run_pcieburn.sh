@@ -30,6 +30,7 @@ PSU_INTERVAL=0.25
 ACTIVE_SUPPLIES=4
 PSU_RATING_W=1600
 NVML_INTERVAL_MS=100
+SETTLE_SECONDS=30
 DURATION=""
 ASSUME_YES=0
 PASSTHRU=()
@@ -68,10 +69,30 @@ Wrapper options:
   --psu-rating W      per-supply rating, for the %-of-rating column (default
                       1600, matching this chassis's CRPS units)
   --nvml-interval MS  NVML sample interval (default 100)
+  --settle SEC        keep every collector running and delay the post-run kernel
+                      log snapshot by SEC seconds (default 30, 0 disables).
+                      This exists because a containment event can land AFTER the
+                      load phase ends: one real run reported "clean" with
+                      exit_code 0 while taking a DPC/ERR_FATAL 8.8 s after the
+                      load stopped and 5 s after the snapshot was taken. The
+                      fault was invisible in that run's own artifacts and was
+                      only recovered from the NEXT run's dmesg_before.
   --yes               skip the interactive safety confirmation
   -h, --help          this message
 
 Everything after `--` goes to pcieburn verbatim. See ./pcieburn --help.
+
+Exit status:
+  0  clean
+  2  COMPUTE FAULTS reported (nonzero faulty/nan counts)
+  3  RANK LOST OR HUNG — a rank died or stopped responding during load
+  4  FAULT AFTER LOAD PHASE — load completed, then a fatal PCIe containment
+     appeared during the settle window. Same severity as 3; distinguished only
+     because the load phase itself completed.
+  5  CLEAN BUT LINK DEGRADED — nothing failed, but at least one GPU ran the
+     whole run below its negotiated width, or dwelt far too long below Gen5.
+     The run is not comparable against full-width runs; see the note it prints.
+  1  setup/usage error
 
 SAFETY: this test tries to reproduce a fault that has previously needed a hard
 power cycle. Run it only on a designated test node.
@@ -92,6 +113,7 @@ while [[ $# -gt 0 ]]; do
         --active-supplies) ACTIVE_SUPPLIES="$2"; shift 2 ;;
         --psu-rating)    PSU_RATING_W="$2"; shift 2 ;;
         --nvml-interval) NVML_INTERVAL_MS="$2"; shift 2 ;;
+        --settle)        SETTLE_SECONDS="$2"; shift 2 ;;
         --yes|-y)        ASSUME_YES=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         --)              shift; PASSTHRU=("$@"); break ;;
@@ -166,6 +188,12 @@ say "uptime at start: $UPTIME_H (booted $BOOT_UTC)"
     # Uptime is recorded because it turned out to correlate with reproduction and
     # was previously only recoverable by digging the first timestamp out of
     # dmesg_before.txt — which fails entirely when the kernel log is restricted.
+    # Bumped whenever this wrapper changes what it measures or how it decides a
+    # verdict, so an artifact bundle is self-describing. v2 added the settle
+    # window and made link degradation gate the verdict; a v1 bundle's "clean"
+    # is a weaker claim than a v2 bundle's.
+    echo "wrapper_version   : 2"
+    echo "settle_seconds    : $SETTLE_SECONDS"
     echo "uptime_seconds    : $UPTIME_S"
     echo "uptime_human      : $UPTIME_H"
     echo "boot_utc          : $BOOT_UTC"
@@ -603,6 +631,19 @@ TAIL_PID=""
 
 say "STOP $(ts_iso) exit=$RC"
 
+# --- settle window -------------------------------------------------------
+# The load ending is not the end of the experiment. Shedding ~2 kW of coherent
+# GPU load in under a second is itself a large electrical transient, and a
+# containment event has been observed firing one second after idle was reached —
+# 8.8 s after the load phase ended. Every collector is still running here
+# (they are only torn down by the EXIT trap), so the fault lands in
+# nvml_trace.csv, aer_counters.csv and psu_current.csv as well as the kernel log.
+if [[ "$SETTLE_SECONDS" -gt 0 ]]; then
+    say "settling ${SETTLE_SECONDS}s before the post-run snapshot (collectors still running)"
+    sleep "$SETTLE_SECONDS"
+    say "SETTLED $(ts_iso)"
+fi
+
 # --- post-run capture ----------------------------------------------------
 capture_kernel_log "$RUNDIR/dmesg_after.txt" || true
 if [[ -s "$RUNDIR/dmesg_after.txt" ]]; then
@@ -610,6 +651,20 @@ if [[ -s "$RUNDIR/dmesg_after.txt" ]]; then
         > "$RUNDIR/dmesg_delta.txt" 2>/dev/null || true
     grep -iE 'xid|aer|dpc|pcieport|nvidia-?smi|gpu has fallen' \
         "$RUNDIR/dmesg_delta.txt" > "$RUNDIR/faults.txt" 2>/dev/null || true
+fi
+
+# Did a FATAL land in this run's window? Correctable AER is expected noise and is
+# deliberately excluded — only containment and endpoint loss count. This is
+# matched against the delta rather than the ranks' own exit status precisely
+# because the ranks can all exit 0 and the link still be gone a few seconds
+# later.
+POST_FATAL=0
+POST_FATAL_WHAT=""
+if [[ -s "$RUNDIR/dmesg_delta.txt" ]]; then
+    POST_FATAL_WHAT=$(grep -oE 'DPC: containment event|ERR_FATAL received|severity=Uncorrected \(Fatal\)|severity=Uncorrectable \(Fatal\)|GPU has fallen off the bus|\[ *5\] SDES' \
+        "$RUNDIR/dmesg_delta.txt" 2>/dev/null | sort -u \
+        | awk '{ printf "%s%s", sep, $0; sep = "; " } END { print "" }')
+    [[ -n "$POST_FATAL_WHAT" ]] && POST_FATAL=1
 fi
 
 # PCIe link state summary. A link that downtrains below Gen5 x16 under load is a
@@ -642,7 +697,50 @@ if [[ -s "$NVML" ]]; then
            "$LINKSTATES" 2>/dev/null; then
         LINK_NOTE=1
     fi
+
+    # Classify what kind of non-Gen5-x16 it is, because the three kinds mean
+    # completely different things and lumping them into one note let a genuinely
+    # degraded run be reported as clean twice:
+    #
+    #   x0            DPC has contained the link. Already fatal; not "degraded".
+    #   width < 16    NEVER legitimate. ASPM negotiates speed, not width, and
+    #                 every GPU slot here is x16. A marginal port came up x8 and
+    #                 ran two entire 600 s runs that way, reporting clean with
+    #                 zero AER errors, while being the most degraded link in the
+    #                 fleet. Half width is a de-rated electrical configuration:
+    #                 the run is not comparable against full-width runs.
+    #   gen < 5       A brief ramp is normal — every healthy GPU here spends
+    #                 ~5.5 s at gen1 while training. A long dwell is not: one
+    #                 port sat at gen1 for 265 s, 48x its peers, in the run where
+    #                 it logged 8018 BadTLP. Threshold is expressed in seconds and
+    #                 converted using this run's own NVML interval.
+    GEN_DWELL_MAX_S=20
+    DEGRADED_LINK=0
+    DEGRADED_WHAT=""
+    DEGRADED_WHAT=$(awk -F'\t' -v ivl="$NVML_INTERVAL_MS" -v maxs="$GEN_DWELL_MAX_S" '
+        {
+            split($3, w, "x"); width = w[2] + 0
+            split($2, g, "gen"); gen = g[2] + 0
+            split($4, c, "="); n = c[2] + 0
+            if (width == 0) next                        # containment, reported elsewhere
+            if (width < 16) { narrow[$1] = $2 " " $3; nsamp[$1] += n; next }
+            if (gen < 5)      slow[$1] += n
+        }
+        END {
+            lim = maxs * 1000 / (ivl > 0 ? ivl : 100)
+            for (gpu in narrow)
+                printf "%s ran %s for %d samples (never legitimate at x16 slots); ",
+                       gpu, narrow[gpu], nsamp[gpu]
+            for (gpu in slow)
+                if (slow[gpu] > lim)
+                    printf "%s dwelt below gen5 for %d samples (%.0fs, limit %ds); ",
+                           gpu, slow[gpu], slow[gpu] * ivl / 1000, maxs
+        }' "$LINKSTATES" 2>/dev/null)
+    [[ -n "$DEGRADED_WHAT" ]] && DEGRADED_LINK=1
 fi
+: "${DEGRADED_LINK:=0}"
+: "${DEGRADED_WHAT:=}"
+: "${POST_FATAL:=0}"
 
 # AER delta table — per-link accumulation of correctable errors over this run.
 # This is the discriminating measurement: it ranks the eight links against each
@@ -747,13 +845,34 @@ fi
     echo
     echo "end_utc           : $(ts_iso)"
     echo "uptime_at_end_s   : $(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)"
-    echo "exit_code         : $RC"
+    echo "rank_exit_code    : $RC"
+    # The ranks' exit status is not the whole verdict. A run whose ranks all
+    # exited 0 can still have lost a link seconds later, and a run that completed
+    # normally can have done so on a de-rated link. Both were observed, and both
+    # were originally recorded as "clean".
     case "$RC" in
-        0) echo "verdict           : clean" ;;
-        2) echo "verdict           : COMPUTE FAULTS reported" ;;
-        3) echo "verdict           : RANK LOST OR HUNG (possible reproduction)" ;;
-        *) echo "verdict           : setup/usage error" ;;
+        0)  if [[ $POST_FATAL -eq 1 ]]; then
+                VERDICT_RC=4
+                echo "verdict           : FAULT AFTER LOAD PHASE (post-window containment)"
+                echo "post_window_fatal : $POST_FATAL_WHAT"
+            elif [[ $DEGRADED_LINK -eq 1 ]]; then
+                VERDICT_RC=5
+                echo "verdict           : CLEAN BUT LINK DEGRADED (not comparable)"
+                echo "degraded_link     : $DEGRADED_WHAT"
+            else
+                VERDICT_RC=0
+                echo "verdict           : clean"
+            fi ;;
+        2)  VERDICT_RC=2; echo "verdict           : COMPUTE FAULTS reported" ;;
+        3)  VERDICT_RC=3; echo "verdict           : RANK LOST OR HUNG (possible reproduction)" ;;
+        *)  VERDICT_RC=$RC; echo "verdict           : setup/usage error" ;;
     esac
+    # Kept for continuity with v1 bundles, where exit_code and the verdict were
+    # the same thing.
+    echo "exit_code         : $VERDICT_RC"
+    if [[ $DEGRADED_LINK -eq 1 && $VERDICT_RC -ne 5 ]]; then
+        echo "degraded_link     : $DEGRADED_WHAT"
+    fi
 } >> "$MANIFEST"
 
 say "artifacts in $RUNDIR:"
@@ -802,9 +921,25 @@ if [[ -s "$LINKSTATES" ]]; then
         say "    check the timestamps to see whether it falls inside the load window:"
         while IFS= read -r l; do say "      $l"; done < "$LINKSTATES"
     fi
+    if [[ $DEGRADED_LINK -eq 1 ]]; then
+        say "    *** LINK DEGRADED: $DEGRADED_WHAT"
+        say "    This run's electrical configuration differs from a full-width,"
+        say "    fully-trained one. Do NOT compare its AER counts against other"
+        say "    runs: a link running at half width can log zero errors while"
+        say "    being the most degraded one present. Retrain and re-check before"
+        say "    using this node for anything comparative:"
+        say "      sudo setpci -s <port> CAP_EXP+10.w=0020:0020   # Retrain Link"
+        say "      sudo ./linkcheck.sh"
+    fi
+fi
+if [[ $POST_FATAL -eq 1 && $RC -eq 0 ]]; then
+    say "  *** FATAL AFTER LOAD PHASE — the ranks all exited 0 and then the link"
+    say "      was lost during the ${SETTLE_SECONDS}s settle window:"
+    say "      $POST_FATAL_WHAT"
+    say "      Without --settle this run would have been recorded as clean."
 fi
 if [[ -s "$RUNDIR/faults.txt" ]]; then
     say "  faults.txt     *** kernel reported PCIe/Xid activity — read this ***"
 fi
 
-exit "$RC"
+exit "${VERDICT_RC:-$RC}"

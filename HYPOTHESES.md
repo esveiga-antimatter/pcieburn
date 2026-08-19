@@ -246,6 +246,54 @@ boot's training outcome, and **its error counts are not comparable across boots.
 This is precisely the `DEGRADED` condition `linkcheck.sh` was written to detect,
 and the run wrapper reported `clean` without flagging it.
 
+### Corpus audit for further false negatives
+
+All 21 post-freeze runs were audited by scanning each boot session's *last* run's
+`dmesg_before`, which spans the whole boot including the gaps between runs, for
+containment and endpoint-loss signatures outside any run's own capture window.
+
+| boot session | covered | out-of-window fatals |
+|---|---|---|
+| rgca18 `23:07` | pl450, pl525, lgc2100 + gaps | none (and zero correctables all boot) |
+| rgca17 `23:07` | pl450, pl525, lgc2100 + gaps | none; all correctables fell inside run windows |
+| cor04 `23:13` | pl450, pl525 + gaps | none |
+| cor04 `00:12` | — | none |
+| cor04 `01:28` | pl450-cold + 9 h gap | none — that run was genuinely clean |
+| rgca17 `01:28` | pl450-cold + 9 h gap | none; zero fatal *and* zero correctable across 9.3 h |
+| rgca18 `01:28` | pl450-cold | **fault #5** — the one false negative in the corpus |
+
+So **exactly one** run in the corpus was misreported. Three runs remain
+unauditable: the last run on a boot that was followed by a reboot leaves its tail
+beyond `dmesg_after` unrecoverable from `dmesg` (rgca17 and rgca18
+`baseline-uncapped`, and rgca17 `pl575-8192`). If the journal is persistent on
+these hosts, `journalctl --list-boots` and `journalctl -b -N` can still recover
+those tails; otherwise treat those three `clean` verdicts as bounded only up to
+their snapshot.
+
+No errors were found in any idle gap between runs, on any node — including
+rgca17's 9.3 h idle stretch. Correctable errors only ever accrue under load.
+
+### Correction: the release edge is not a general driver
+
+The load-release observation is scoped to rgca18 fault #5 and does not generalise.
+Binning every correctable kernel line by its position relative to load end:
+
+| run | lines | in first 90% | final 10% | after load end |
+|---|---|---|---|---|
+| rgca17 uncapped | 146 | 146 | 0 | 0 |
+| rgca17 pl525 | 9 | 0 | 9 | 0 |
+| rgca17 lgc2100 | 23 | 2 | 11 | 10 |
+| rgca17 pl575-8192 | 41 | 41 | 0 | 0 |
+| rgca18 pl575-8192 | 191 | 188 | 3 | 0 |
+| rgca18 pl450-8192 | 616 | 487 | 118 | 11 |
+| cor04 pl450-warm | 80 | 80 | 0 | 0 |
+
+Two low-count rgca17 runs put essentially all their errors in the tail, which is
+not chance at those counts, but the high-count runs put them mid-load. And **four
+of the six fatals — every cor04 fault — happened mid-load with no release
+involved.** Hypothesis 9 therefore rests on fault #5's timing plus fault #4's
+coherent-peak coincidence, and is not yet supported as a general mechanism.
+
 ### Two harness gaps this exposed
 
 - **`dmesg_after` is snapshotted too early.** A fault during or just after
@@ -282,7 +330,7 @@ scratched rounds have been dropped where real data now exists.
 | # | Hypothesis | Basis | Next test |
 |---|---|---|---|
 | 8 | **PHY/SerDes margin falls as cap clipping rises** (term C). | **Partly supported, and the original framing was wrong.** The 694k-error run was *not* clean (fault 5), so a lower cap does not buy fatal-margin — it buys more correctables *and* still faults. Clipping fraction tracks the error count on rgca18 (47% / 694k vs 35% / 1.8k), but rgca17 clipped 46% with zero errors while running x8, so term A gates it. | `-pl 400` on a reset rgca18: predicts still more correctables and still a fatal |
-| 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
+| 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
 | 10 | **Per-boot link training outcome sets the link's margin**, independently of workload. | rgca17 GPU6 trained to three different states across three boots (265 s gen1 dwell; clean x16; x8 twice) and its error counts followed the trained state, not the arm. | `linkcheck.sh` at every boot before any load; retrain with `setpci CAP_EXP+10.w=0020:0020` and record whether the state holds. Never compare error counts across boots without recording the trained state. |
 
 
