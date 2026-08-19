@@ -246,43 +246,63 @@ boot's training outcome, and **its error counts are not comparable across boots.
 This is precisely the `DEGRADED` condition `linkcheck.sh` was written to detect,
 and the run wrapper reported `clean` without flagging it.
 
-### The first edge-rate arm was confounded (`--gemms-per-coll 1`, 2 runs x 2 hosts)
+### Edge rate, tested properly: refuted
+
+Two arms were needed because the first was confounded. Both are recorded, because
+the confounded one is what made the design error visible.
+
+| arm | edges/s | mean W (t=60–93 s) | temp | PCIe | outcome |
+|---|---|---|---|---|---|
+| N=94, coll 128M–1G (reference) | 1.14 | 495.8 | 63.6 °C | 0.6% | **FAULT 107 s** |
+| N=1, coll 128M–1G (confounded) | ~43 | 284.1 | 46.5 °C | 29.4% | clean x2, both hosts |
+| **N=1, coll 4M (controlled)** | **107** | **541.4** | 65.4 °C | 0.5% | **FAULT 95 s** |
+
+The controlled arm hit its design target — 53.7 collectives/s per rank, traffic
+matched at 0.5% against 0.6% — by scaling collective size in proportion to N so
+duty cycle held. Because `t_coll` scales with size, fixing duty fixes traffic
+automatically and edge rate varies as 1/N.
+
+**Result: ~90x the coherent current edges moved time-to-fault by 11%.** Power came
+in 9% *above* the reference (the 4 MiB collective is partly latency-floored rather
+than bandwidth-scaled, so duty overshot), which means the arm was harsher and still
+did not fault meaningfully faster. Hypothesis 12 is refuted.
+
+cor04's fault was its usual one: `a0:01.1` -> GPU5 `a1:00.0`, `SDES`,
+`status:0x1f01`, GPU5 alone to x0 while the other seven held x16, and all eight
+GPUs given `Xid 154` recovery action **0x2 (Node Reboot Required)** — a full reboot,
+not a GPU reset. Afterwards `nvidia-smi -L` showed 7 of 8. Its tally is now GPU5 x3
+(282, 107, 95 s) and GPU0 x2 (214, 224 s), still alternating with no pattern. For the
+third time the correctables landed on **GPU0's** port (922 BadTLP on `00:01.1`)
+while GPU5 died.
+
+rgca17 stayed clean through the full 600 s and was **healthy afterwards** — nothing
+in `dmesg` past the AER messages, `nvidia-smi -L` reporting all 8. But its
+`34:10.0` did log **42 RxErr / 511 BadTLP**, the first non-zero on that port since
+the `23:07` boot, at full x16 width, and episodic as always: 63 lines at t=60–120 s,
+two at t=240–300, silence for the final 300 s. That cannot be attributed to edge
+rate — against the confounded arm's zero, this one has 90x the edges *and* 2x the
+power.
+
+#### Why the first arm was confounded
 
 `--gemms-per-coll` is **not** an edge-rate knob at fixed amplitude, which is how
 hypothesis 12 originally specified it. Fewer GEMMs per collective means
 proportionally more time *inside* the collective, so duty cycle and mean power fall
-with it. Against the reference arm (cor04 pl575 8192 N=94, faulted at 107 s), N=1
-moved four things in opposing directions:
+with it: at N=1 with the default collective, GEMM duty fell 94% -> 37% and mean power
+494 -> 277 W. At 277 W the arm sat below any faulting power observed (437 W clean,
+494 W faulted on cor04), so `clean` was explained by power and the arm said nothing
+about edge rate. The fix was to scale collective size with N, holding duty.
 
-| | N=94 reference | N=1 | direction | h12 predicted |
-|---|---|---|---|---|
-| edges/s | 1.14 | ~43 | **39x more** | worse |
-| PCIe utilisation | 0.6% | 29.4% | 50x more | neutral (bandwidth ruled out) |
-| mean power (t=60–105 s) | 493.7 W | **276.9 W** | 44% less | better |
-| temperature | 61 °C | 46 °C | 15 °C less | better |
-| GEMM duty cycle | 94% | 37% | — | — |
+**Do not compare the p2–p98 swing across arms with different duty cycles.** It reads
+170 W at N=94 against 258 W at N=1, which looks like larger amplitude and is an
+artifact: at N=94 the GPU is in the low state ~6% of the time, so NVML rarely samples
+it and its ~400 ms averaging smears what it catches.
 
-All four runs clean (cor04 and rgca17, at 687 s and ~2160 s uptime), zero AER
-anywhere, no fatal in the idle gaps either. At 277 W the arm sits far below any
-faulting power observed (437 W clean, 494 W faulted on cor04), so `clean` is fully
-explained by power and the arm says little about edge rate.
-
-The one thing it does contribute: 39x more transients *and* 50x more traffic
-produced zero faults and zero correctables on both nodes. Weak, because power fell
-at the same time — but a pure transient-count mechanism should have shown something.
-
-**Do not compare the p2–p98 swing across these arms.** It reads 170 W at N=94
-against 258 W at N=1, which looks like larger amplitude and is an artifact: at N=94
-the GPU is in the low state ~6% of the time, so NVML rarely samples it and its
-~400 ms averaging smears what it catches. Measured swing is a function of duty
-cycle.
-
-Also recorded from these runs: **rgca17's gpu6 came back up at x16** — 62-sample
-normal ramp, full width — recovering from the x8 state it held across two runs on
-the previous boot, with no intervention. It logged **zero** AER under the highest
-traffic and edge rate yet run, where the earlier x16 boot gave 8018 BadTLP in the
-2048 uncapped arm. Its error behaviour tracks neither traffic nor edge rate, only
-per-boot training outcome. Third independent vote for hypothesis 10.
+Also recorded from the confounded pair: **rgca17's gpu6 came back up at x16** —
+62-sample normal ramp, full width — recovering from the x8 state it held across two
+runs on the previous boot, with no intervention, and logged zero AER under 29.4% of
+Gen5 x16. Its error behaviour tracks per-boot training outcome rather than workload.
+Third independent vote for hypothesis 10.
 
 ### Corpus audit for further false negatives
 
@@ -462,7 +482,7 @@ scratched rounds have been dropped where real data now exists.
 | 8 | **PHY/SerDes margin falls as cap clipping rises** (term C). | **Partly supported, and the original framing was wrong.** The 694k-error run was *not* clean (fault 5), so a lower cap does not buy fatal-margin — it buys more correctables *and* still faults. Clipping fraction tracks the error count on rgca18 (47% / 694k vs 35% / 1.8k), but rgca17 clipped 46% with zero errors while running x8, so term A gates it. | `-pl 400` on a reset rgca18: predicts still more correctables and still a fatal |
 | 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
 | 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | hivenet reported zero servers down over 28 days; the fault corpus is entirely `tenant: fal` baremetal. Both tenants share the `cor`, `rgca` and `roca` sites, so site and topology class are *not* the difference. `perfvm_host` membership sets `kernel_iommu: true` → GRUB IOMMU + VFIO, which routes error recovery through `vfio-pci` rather than the NVIDIA RM. We already know `_OSC` AER/DPC ownership varies across this fleet with identical board and BIOS. | Enable IOMMU on a test node via kernel cmdline — no code, no new instrumentation — and re-run a known-reproducing arm. **First, though, resolve the two cheaper questions below: the comparison may be an artifact.** |
-| 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | The waveform is a square wave, not a spike train: unpaced GEMMs run back-to-back so current holds high across the whole burst, and modulation happens at the pass boundary where compute hands over to the collective's DMA. Reference arm (8192, N=94): fundamental 0.57 Hz, ~1.14 edges/s, mean 493.7 W, 93.6% duty. Distinct from hypothesis 9, which is about *coherence across GPUs*; this is about *rate per GPU*. **First attempt was confounded — see below.** | Scale collective size in proportion to N so duty cycle is held: `--matrix-dim 8192 --gemms-per-coll 1 --coll-min 4M --coll-max 4M` predicts ~54 colls/s = **108 edges/s vs 1.14, 94x**, at matched mean power (~494 W), matched duty and matched traffic (~274 vs 288 MiB/s nominal). Verify power in the t=60-105 s window before interpreting: if `t_coll` at 4 MiB is latency-floored rather than bandwidth-scaled, duty lands high and power overshoots — step the collective to 8M/16M until power matches. |
+| 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | **REFUTED, and this is the investigation's first properly controlled single-factor test.** ~90x more coherent current edges at matched duty cycle and matched PCIe traffic changed time-to-fault by 11% (107 s -> 95 s) on cor04. A transient-count mechanism predicts TTF collapsing toward ~1 s. The arm also overshot power by 9% (541 vs 496 W), so it was *harsher* than the reference and still did not fault meaningfully faster. Together with hypothesis 1 (100x *less* dispatch -> worse), the transient-rate family is now empty in both directions. | Closed. n=1 per arm and exponential TTF gives +/-100% on a single event, so the 11% itself is noise — but the *absence* of a 90x effect is not a subtle inference. Reopen only with a mechanism that survives both refutations. |
 | 10 | **Per-boot link training outcome sets the link's margin**, independently of workload. | rgca17 GPU6 trained to three different states across three boots (265 s gen1 dwell; clean x16; x8 twice) and its error counts followed the trained state, not the arm. | `linkcheck.sh` at every boot before any load; retrain with `setpci CAP_EXP+10.w=0020:0020` and record whether the state holds. Never compare error counts across boots without recording the trained state. |
 
 
