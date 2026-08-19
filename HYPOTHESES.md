@@ -246,6 +246,44 @@ boot's training outcome, and **its error counts are not comparable across boots.
 This is precisely the `DEGRADED` condition `linkcheck.sh` was written to detect,
 and the run wrapper reported `clean` without flagging it.
 
+### The first edge-rate arm was confounded (`--gemms-per-coll 1`, 2 runs x 2 hosts)
+
+`--gemms-per-coll` is **not** an edge-rate knob at fixed amplitude, which is how
+hypothesis 12 originally specified it. Fewer GEMMs per collective means
+proportionally more time *inside* the collective, so duty cycle and mean power fall
+with it. Against the reference arm (cor04 pl575 8192 N=94, faulted at 107 s), N=1
+moved four things in opposing directions:
+
+| | N=94 reference | N=1 | direction | h12 predicted |
+|---|---|---|---|---|
+| edges/s | 1.14 | ~43 | **39x more** | worse |
+| PCIe utilisation | 0.6% | 29.4% | 50x more | neutral (bandwidth ruled out) |
+| mean power (t=60–105 s) | 493.7 W | **276.9 W** | 44% less | better |
+| temperature | 61 °C | 46 °C | 15 °C less | better |
+| GEMM duty cycle | 94% | 37% | — | — |
+
+All four runs clean (cor04 and rgca17, at 687 s and ~2160 s uptime), zero AER
+anywhere, no fatal in the idle gaps either. At 277 W the arm sits far below any
+faulting power observed (437 W clean, 494 W faulted on cor04), so `clean` is fully
+explained by power and the arm says little about edge rate.
+
+The one thing it does contribute: 39x more transients *and* 50x more traffic
+produced zero faults and zero correctables on both nodes. Weak, because power fell
+at the same time — but a pure transient-count mechanism should have shown something.
+
+**Do not compare the p2–p98 swing across these arms.** It reads 170 W at N=94
+against 258 W at N=1, which looks like larger amplitude and is an artifact: at N=94
+the GPU is in the low state ~6% of the time, so NVML rarely samples it and its
+~400 ms averaging smears what it catches. Measured swing is a function of duty
+cycle.
+
+Also recorded from these runs: **rgca17's gpu6 came back up at x16** — 62-sample
+normal ramp, full width — recovering from the x8 state it held across two runs on
+the previous boot, with no intervention. It logged **zero** AER under the highest
+traffic and edge rate yet run, where the earlier x16 boot gave 8018 BadTLP in the
+2048 uncapped arm. Its error behaviour tracks neither traffic nor edge rate, only
+per-boot training outcome. Third independent vote for hypothesis 10.
+
 ### Corpus audit for further false negatives
 
 All 21 post-freeze runs were audited by scanning each boot session's *last* run's
@@ -424,7 +462,7 @@ scratched rounds have been dropped where real data now exists.
 | 8 | **PHY/SerDes margin falls as cap clipping rises** (term C). | **Partly supported, and the original framing was wrong.** The 694k-error run was *not* clean (fault 5), so a lower cap does not buy fatal-margin — it buys more correctables *and* still faults. Clipping fraction tracks the error count on rgca18 (47% / 694k vs 35% / 1.8k), but rgca17 clipped 46% with zero errors while running x8, so term A gates it. | `-pl 400` on a reset rgca18: predicts still more correctables and still a fatal |
 | 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
 | 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | hivenet reported zero servers down over 28 days; the fault corpus is entirely `tenant: fal` baremetal. Both tenants share the `cor`, `rgca` and `roca` sites, so site and topology class are *not* the difference. `perfvm_host` membership sets `kernel_iommu: true` → GRUB IOMMU + VFIO, which routes error recovery through `vfio-pci` rather than the NVIDIA RM. We already know `_OSC` AER/DPC ownership varies across this fleet with identical board and BIOS. | Enable IOMMU on a test node via kernel cmdline — no code, no new instrumentation — and re-run a known-reproducing arm. **First, though, resolve the two cheaper questions below: the comparison may be an artifact.** |
-| 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | The waveform is a square wave, not a spike train: unpaced GEMMs run back-to-back so current holds high for the whole burst, and the modulation is at the pass boundary where compute hands over to the collective's DMA. Measured: fundamental 0.57 Hz at full burst, amplitude 193 W/GPU (NVML p2..p98, low state 384 W not idle) = 16.1 A/GPU on 12 V = **129 A coherent, 1.5 kW**. Distinct from hypothesis 9, which is about *coherence across GPUs*; this is about *rate per GPU*. | `--gemms-per-coll` is an edge-rate knob at **fixed amplitude**, which is the clean separation (`--matrix-dim` sets amplitude, `--gemms-per-coll` sets rate). On the 8192 arm: N = 1 / 4 / 16 / 64 / 94 gives 15.4 / 11.0 / 5.1 / 1.6 / 1.1 edges/s — **9,251 vs 686 edges per 600 s run, 13x, at identical amplitude, load and exposure.** If fault rate tracks edge count, transient excitation is implicated; if it tracks exposure regardless of edge count, the mechanism is cumulative/thermal, which is where hypothesis 4 points. Use 8192, not 2048 — the 2048 arm spans only 2x (1.83–4.01 Hz) because `t_coll` swamps `t_gemm`. |
+| 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | The waveform is a square wave, not a spike train: unpaced GEMMs run back-to-back so current holds high across the whole burst, and modulation happens at the pass boundary where compute hands over to the collective's DMA. Reference arm (8192, N=94): fundamental 0.57 Hz, ~1.14 edges/s, mean 493.7 W, 93.6% duty. Distinct from hypothesis 9, which is about *coherence across GPUs*; this is about *rate per GPU*. **First attempt was confounded — see below.** | Scale collective size in proportion to N so duty cycle is held: `--matrix-dim 8192 --gemms-per-coll 1 --coll-min 4M --coll-max 4M` predicts ~54 colls/s = **108 edges/s vs 1.14, 94x**, at matched mean power (~494 W), matched duty and matched traffic (~274 vs 288 MiB/s nominal). Verify power in the t=60-105 s window before interpreting: if `t_coll` at 4 MiB is latency-floored rather than bandwidth-scaled, duty lands high and power overshoots — step the collective to 8M/16M until power matches. |
 | 10 | **Per-boot link training outcome sets the link's margin**, independently of workload. | rgca17 GPU6 trained to three different states across three boots (265 s gen1 dwell; clean x16; x8 twice) and its error counts followed the trained state, not the arm. | `linkcheck.sh` at every boot before any load; retrain with `setpci CAP_EXP+10.w=0020:0020` and record whether the state holds. Never compare error counts across boots without recording the trained state. |
 
 
@@ -671,6 +709,14 @@ degraded one. Width and gen are part of the experimental condition, not backgrou
 running after a rank dies, so a whole-run mean blends load with teardown idle. This
 put one node's per-GPU power at ~400 W against ~520 W for its peers and made the
 victim GPU look like a dramatic outlier; in a matched t=60-105 s window it was +2%.
+
+**Check what else a knob moves before calling it a single-factor lever.**
+`--gemms-per-coll` was specified as an edge-rate knob at fixed amplitude and is
+actually an edge-rate *and duty-cycle* knob: at N=1 the GEMM duty fell 94% -> 37%
+and mean power 494 -> 277 W, so the arm could not test what it was built for. Write
+down every quantity a knob changes — rate, amplitude, duty cycle, mean power,
+traffic — and confirm from the artifacts which of them actually moved, before
+reading the outcome as evidence about the intended factor.
 
 **Do not infer an edge rate or slew from NVML.** `power.draw` repeats across 3–4
 consecutive 100 ms polls, so the effective update period is ~300–400 ms and Nyquist
