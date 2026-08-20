@@ -397,6 +397,44 @@ table keeps its old semantics). Validated against the archive: the x8 runs and t
 across all GPUs is the signature of the artifact — real degradation is per-link.**
 The four v2 verdicts in this batch should be read as clean.
 
+### up700s repeat 2 (wrapper v3's first batch) — rgca17's first fault
+
+Three runs, 2026-08-20 ~02:49, `baseline-uncapped`, actual uptimes ~1500 s (the
+tag says up700s; post-fault reboots shifted the starts — the manifest is
+authoritative):
+
+| node | uptime | pre-fault W | outcome |
+|---|---|---|---|
+| cor04 | 1499 s | 493 | **FAULT 60.7 s** — GPU0 `00:01.1`, ERR_FATAL, third GPU0 fault in a row |
+| rgca17 | 1495 s | 402 | **FAULT 201.4 s** — **first rgca17 fault in 13 runs** |
+| rgca18 | 1527 s | 398 | clean |
+
+**rgca17's first fault came from exactly the slot term A identified**: `ERR_FATAL
+received from 0000:36:00.0` = gpu6, the marginal `34:10.0` link that produced
+every one of the node's historical correctables — contained at the shared root
+port `1a:01.1`, all 8 GPUs to x0, full switch-node blast radius. Only 1 RxErr /
+1 BadTLP preceded it: near-silent this time. Two standing claims retire:
+"rgca17 never faults" is dead, and with it the strong reading of the slot term —
+**all three nodes fault; susceptibility sets the rate and the victim slot, not
+immunity.** Every fatal in the fleet has now come from a previously-identified
+per-node slot (cor04 GPU0/GPU5, rgca17 gpu6, rgca18 gpu4).
+
+Under every fitted model this cell had P(fault) ≈ 0.01–0.04 — the most surprising
+single outcome of the campaign, hence the most informative. Note also both faults
+landed in the same simultaneously-started batch, 2.5 min apart, at ~02:50 local:
+ambient/time-of-day remains unmeasured (protocol item: BMC inlet temp is still
+not being logged).
+
+**The cor04 staircase after two repeats: 282.2 → 65.6 → 60.7 s** at matched
+~494 W. Direction is wear-ward, but the refit (35 runs, 10 faults) still keeps
+the wear MAP near zero — two short draws in a row have ~10% probability under
+constant hazard, not yet a trend. The refit also softened the power slope
+(bP back to +0.75, x2.1 per +50 W: rgca17's 402 W fault pulls it down) and
+**narrowed slot-vs-no-slot to lnBF ≈ 1.5** — the slot term's strongest evidence
+was rgca17's zero, now gone. slot x power remains the standing model; nothing
+else earns a parameter. Updated predictive spreads keep the same test ranking:
+the low-power cell (0.10 vs 0.62) and the staircase remain the two live probes.
+
 ### Bayesian model comparison (32 runs, `bayes_models.py`)
 
 Constant-hazard survival models fitted to every usable run (7 fault events,
@@ -652,7 +690,7 @@ scratched rounds have been dropped where real data now exists.
 | 3 | Clock/voltage pinning (transient suppression). | **Actively harmful, 2/2 nodes.** `lgc2100` did worse than the free-clock arm at *higher* power on both cor04 (398 W faulted vs 437 W clean) and rgca17 (326 W, 21 errors vs 362 W, 0). Folded into term C. | `-lgc` **near boost** (~2550) so only variation is removed, not level. A low lock moves level, variation and dispatch rate at once. |
 | 4 | Uptime / time since cold boot. | **DEMOTED from confirmed-causal.** The controlled pair (clean at 216 s uptime vs fault at 33,347 s, 438/440 W) stands, but the follow-ups moved against a smooth soak effect: clean at 4082 s uptime (pl450-8192, wear=5), fault at 812 s uptime (baseline re-run, 494 W), and the 32-run refit puts the soak MAP at zero. What remains viable is a **threshold** in (4082 s, 33347 s] — never tested by the smooth model — or the pair's effect belongs to wear/ambient (h14). | continue the bisection from above: ~4 h and ~9 h points at pl450-8192 on cor04; read jointly with the h14 staircase |
 | 5 | **Interleaving** — the question the harness was built for. | Weakened further: the 8192 arm moved 0.8% of Gen5 x16 versus 2.5-3.0% in the baseline and faulted *more*. | `--coll-min/--coll-max` 128M vs 4G at fixed compute. 32x bytes moved. If time-to-fault is unchanged, PCIe traffic is exonerated outright. |
-| 6 | Per-machine susceptibility. | **Confirmed, and per-slot.** cor04 GPU5 `a0:01.1` + GPU0 `00:01.1` (alternating, 4 faults); rgca18 GPU4 `2b:10.0` (2 faults); rgca17 zero. rgca17/18 share identical BDF maps, so these are different physical slots on identical boards. Term A. | read-only `Lane Error Status` and `LnkSta2` equalization on the three implicated ports vs healthy peers; then card/slot swap |
+| 6 | Per-machine susceptibility. | **Revised: susceptibility sets rate and victim, not immunity.** All three nodes have now faulted (cor04 x7, rgca18 x2, rgca17 x1). Victim slots are stable per node and every fatal has come from a previously-identified slot: cor04 GPU5 `a0:01.1` (SDES, silent) + GPU0 `00:01.1` (ERR_FATAL, correctable-generating); rgca17 gpu6 `34:10.0`; rgca18 gpu4 `2b:10.0`. rgca17/18 share identical BDF maps, so these are different physical slots on identical boards. | read-only `Lane Error Status` / `LnkSta2` on the four implicated links vs healthy peers; then card/slot swap using the direction split (h13) to interpret |
 | 7 | Topology class (riser vs switchboard). | **Confirmed, distinct in both mechanism and blast radius.** COR04 faults are `SDES`/`ERR_FATAL` with no precursor and contain 1 GPU. RGCA's fault ran a 200 s correctable ramp first and, because all eight GPUs sit behind the single root port `1a:01.1`, containment took **all 8** down with `device recovery failed`. | never pool the classes; compare within class only |
 
 **New this round, not previously on the ledger:**
