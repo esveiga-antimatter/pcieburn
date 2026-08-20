@@ -586,6 +586,57 @@ coherent-peak coincidence, and is not yet supported as a general mechanism.
 ---
 
 
+## Third platform: intelmgx-CG480 (8x RTX PRO 6000 Blackwell Server, loaner)
+
+**Never pool this box's numbers with cor04/RGCA data.** It differs on every axis
+at once: same GB202 die but the PRO SKU (more SMs, 600 W default), dual-socket
+Intel MGX host, **four PCIe switches with two GPUs each** (PIX pairs 0/1, 2/3,
+4/5, 6/7 across two NUMA domains — a third topology class, blast radius 2),
+**P2P enabled on all pairs**, driver 595.91.07 / CUDA 13.2 vs the fleet's 580,
+and — critically — **firmware-first error handling**: every host bridge reports
+`_OSC: platform does not support [AER DPC]`, GHES/APEI is on, no port has
+kernel-managed DPC, and recovery would go through EDR.
+
+**Observability consequence:** `aer_delta.txt` is structurally blind here — the
+OS never receives native AER events, so zero counters mean nothing. The
+observables on this box are kernel GHES/CPER (`Hardware Error` lines, rasdaemon)
+and the **BMC SEL** (`ipmitool sel list` bracketed around every run). This is
+also the native configuration for the fleet's original PERR/SERR symptom — the
+BMC sees errors first by design — so any event here exercises the exact
+misinterpretation chain the investigation started from. Its power telemetry is
+healthy where the fleet's is broken (`PSU*_POWER_OUT` unsaturated at >1 kW,
+`PSU*_IOUT`, and an ambient sensor `PSU1_AMB_TEMP`), and the driver exposes
+`temperature.gpu.tlimit` plus `clocks_event_reasons_counters.*` — cumulative
+seconds under each throttle cause, a rigorous replacement for the clip% proxy.
+
+Baseline state found on arrival: links uniformly clean (gen5 x16, ASPM disabled,
+no training anomalies), endpoint `CEMsk` all clear (spec default — nothing
+masked, see h13), a leftover 430 W power limit from a prior tenant (reset and
+record), and a prior workload that ended before our runs.
+
+**Pre-registered tests and predictions** (value is in falsifying die-level
+explanations; this platform has none of our marginal slots):
+
+1. Calibration nulls — the two frozen arms (2048 mixed uncapped; 8192-single at
+   600 W), 600 s. *Predict: no fault, no SEL entry, no CPER.* Any GPU→upstream
+   correctable surfacing via SEL/CPER on clean pro hardware would promote h13
+   from "our boards" to GB202-generic; a fault would be larger news.
+2. P2P A/B — same arm with `NCCL_P2P_DISABLE=1` (fleet-matched host staging)
+   vs `0` (peer traffic), plus a `--gpus 0,1` PIX-pair cell where collective
+   traffic never leaves one switch. *Predict: no behavioral difference in fault
+   terms (bandwidth is exonerated); byte-accounting lines invalid under P2P
+   (`PCIE_HOST_STAGING_MULT` assumes staging — read as relative only).* With P2P
+   off, each switch uplink carries two GPUs' staged traffic — the highest
+   per-root-port load of any configuration yet run; the exoneration data says
+   it still does nothing.
+3. Power ladder 300/450/600 W with the T.Limit + throttle-counter sidecar.
+   Deliverable: edge-vs-worst-internal-sensor delta on GB202 under our GEMM
+   load, and exact seconds under `sw_power_cap`/`hw_power_brake`.
+4. Boot-training loop: ~8 reboots, `linkcheck.sh --csv` each boot pre-load.
+   *Predict (h10): zero training variance on this platform; variance is a
+   fleet BIOS/riser property, not GB202/driver.*
+5. `dcgmi diag -r 3` as the original-reproducer cross-check.
+
 ## Tenant workload profile: hivenet's vLLM serving
 
 **Read the role of this section carefully.** The profile below was supplied by the
@@ -701,7 +752,7 @@ scratched rounds have been dropped where real data now exists.
 | 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
 | 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | hivenet reported zero servers down over 28 days; the fault corpus is entirely `tenant: fal` baremetal. Both tenants share the `cor`, `rgca` and `roca` sites, so site and topology class are *not* the difference. `perfvm_host` membership sets `kernel_iommu: true` → GRUB IOMMU + VFIO, which routes error recovery through `vfio-pci` rather than the NVIDIA RM. We already know `_OSC` AER/DPC ownership varies across this fleet with identical board and BIOS. | Enable IOMMU on a test node via kernel cmdline — no code, no new instrumentation — and re-run a known-reproducing arm. **First, though, resolve the two cheaper questions below: the comparison may be an artifact.** |
 | 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | **REFUTED, and this is the investigation's first properly controlled single-factor test.** ~90x more coherent current edges at matched duty cycle and matched PCIe traffic changed time-to-fault by 11% (107 s -> 95 s) on cor04. A transient-count mechanism predicts TTF collapsing toward ~1 s. The arm also overshot power by 9% (541 vs 496 W), so it was *harsher* than the reference and still did not fault meaningfully faster. Together with hypothesis 1 (100x *less* dispatch -> worse), the transient-rate family is now empty in both directions. | Closed. n=1 per arm and exponential TTF gives +/-100% on a single event, so the 11% itself is noise — but the *absence* of a 90x effect is not a subtle inference. Reopen only with a mechanism that survives both refutations. |
-| 13 | **The failing direction is uniformly GPU→upstream (GPU TX / board RX).** The marginal element is on the GPU side of every link: its transmitter, its PHY supply, or the TX pairs of its connector path. | Corpus-wide aggregation of all 27 runs' AER tables: upstream-facing receivers logged **697,865 RxErr / 93,547 BadTLP / 6,274 BadDLLP**; GPU (dev) rows logged **zero** of all three, while logging 959 Rollover — so their AER reporting works and the zero is real. The story is coherent: GPU transmits bad → receiver logs RxErr/BadTLP → GPU replays → GPU Rollover. Sole exception: 58 Rollover on `34:10.0` (downstream TX) in the one bad-training run, 0.008% of the corpus. Both fatal classes fit too: `SDES` = the root port stops hearing the GPU; `ERR_FATAL received from <GPU>` = the GPU reports its own escalation. Also explains the BMC symptom: host-side receivers seeing bad data is what IPMI misreads as PERR/SERR. | **First verify the zero is not a mask artifact:** AER correctable masks are per-bit, so a GPU reporting Rollover does not prove RxErr/BadTLP are unmasked — read the `CEMsk:` line via `lspci -vvv` on a GPU. If RxErr is masked there, h13 needs re-grounding. Then: on a card/slot swap (h6's test), direction sharpens the interpretation: if errors follow the card, GPU TX PHY or its supply; if they stay with the slot, the slot's RX path or the connector TX pairs. Read-only now: `Lane Error Status` on the three implicated receiving ports localizes which lanes take the hits. |
+| 13 | **The failing direction is uniformly GPU→upstream (GPU TX / board RX).** The marginal element is on the GPU side of every link: its transmitter, its PHY supply, or the TX pairs of its connector path. | Corpus-wide aggregation of all 27 runs' AER tables: upstream-facing receivers logged **697,865 RxErr / 93,547 BadTLP / 6,274 BadDLLP**; GPU (dev) rows logged **zero** of all three, while logging 959 Rollover — so their AER reporting works and the zero is real. The story is coherent: GPU transmits bad → receiver logs RxErr/BadTLP → GPU replays → GPU Rollover. Sole exception: 58 Rollover on `34:10.0` (downstream TX) in the one bad-training run, 0.008% of the corpus. Both fatal classes fit too: `SDES` = the root port stops hearing the GPU; `ERR_FATAL received from <GPU>` = the GPU reports its own escalation. Also explains the BMC symptom: host-side receivers seeing bad data is what IPMI misreads as PERR/SERR. | **First verify the zero is not a mask artifact:** AER correctable masks are per-bit, so a GPU reporting Rollover does not prove RxErr/BadTLP are unmasked — read the `CEMsk:` line via `lspci -vvv` on a GPU. If RxErr is masked there, h13 needs re-grounding. **Checked on the MGX PRO 6000 under driver 595: CEMsk all clear — spec default, nothing masked.** The fleet 5090/580 check (OS-first, where the kernel could set masks) is still pending and remains the authoritative one. Then: on a card/slot swap (h6's test), direction sharpens the interpretation: if errors follow the card, GPU TX PHY or its supply; if they stay with the slot, the slot's RX path or the connector TX pairs. Read-only now: `Lane Error Status` on the three implicated receiving ports localizes which lanes take the hits. |
 | 14 | **Cumulative wear, not within-boot soak** — repeated faults/containments progressively degrade the marginal slot, and h4's "uptime" is proxying it. | The cap-575 TTF decline on cor04 (282 → 214 → 107 → 95 s) spans **four different boots**, so within-boot uptime, wall-clock campaign time, cumulative fault count (0, 1, 2, 4 prior), and ambient time-of-day all rise together across it — the series cannot distinguish them. Weak counter-evidence: GPU0's BadTLP at pl450 *fell* from 32,275 (early) to 3,954 (late). Ambient is entirely unmeasured. **First re-run landed:** TTF 65.6 s vs 282.2 s at matched 494 W and matched uptime — direction matches wear, but it is a single draw with ~21% probability under the constant-hazard null, and the refit keeps the wear MAP at zero. | Cheap and near-decisive: re-run `baseline-uncapped` exactly, at matched ~700 s uptime. Wear predicts TTF ≪ 282 s; soak predicts ≈ 282 s. Also start logging BMC inlet temperature per run — one `ipmitool sdr` read in the wrapper — to kill the ambient confound. |
 | 15 | **The soak variable is idle link-state residency / training age, not time or temperature.** GPUs autonomously downtrain to gen1 while idle; hours of idle-at-gen1 (or a stale training) may be what erodes the link, and retraining may reset it. | The pl450-warm fault (TTF 224 s at 33,347 s uptime) followed **~9 h of idle** — the node was at ambient temperature at load start, so whatever "soak" is, it survives complete thermal relaxation and **cannot be junction/board temperature**. What does persist across 9 h idle: link-training age, idle gen1 residency, driver/GSP state age. | Before a warm run, force a retrain (`setpci CAP_EXP+10.w=0020:0020` on the implicated ports, confirm gen5 x16 via `linkcheck.sh`), then run the arm. TTF back at cold values → training age/residency is the mechanism and a periodic retrain is a cheap fleet mitigation. TTF still short → driver/system state age or wear (h14). |
 | 16 | **Thermal-cycle depth/count, not temperature level** — each cold→hot→cold excursion is one fatigue/fretting cycle; idle time matters as *cycle depth*, not as elapsed time. | Re-explains the 9 h-idle fault as the campaign's deepest thermal relaxation followed by full reheat, and gives h14 a physical mechanism (thermo-mechanical micro-motion → fretting at the connector, whose card-TX pins sit in their own physical group → tracks h13's direction uniformity). Constraints already in hand: fault timing rules out an instantaneous dT/dt trigger (4 of 6 faults landed well after thermal settle), and the h12 pair disfavours per-pass micro-cycling (13.5x more, shallower cycles → Coffin–Manson predicts *less* damage/s, observed TTF unchanged). Run-level ΔT is collinear with power at fixed cooling, so the corpus cannot test this observationally. | The 2x2 that separates h15 from h16 on a long-idled cor04, same arm: {retrain, no-retrain} x {pre-warm 10 min light load, cold start}. h15 predicts retrain rescues regardless of warmth; h16 predicts pre-warming rescues regardless of retrain. Also the cycle-count arm: 6 x 100 s with ~5 min cool-down gaps vs 1 x 600 s at matched cap and total load-seconds. |
