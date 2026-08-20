@@ -614,6 +614,16 @@ no training anomalies), endpoint `CEMsk` all clear (spec default — nothing
 masked, see h13), a leftover 430 W power limit from a prior tenant (reset and
 record), and a prior workload that ended before our runs.
 
+**BLOCKED — box is compromised (found 2026-08-20).** nvtop revealed seven
+root-owned cryptominer processes (masquerading as `systemd-update-helper --coin
+pearl -o hk.pearl...`, ~2122 MiB and 15–29% on every GPU) that are hidden from
+`nvidia-smi --query-compute-apps` — i.e. NVML process enumeration is hooked. The
+430 W cap and 429 W draw noted on arrival were this miner, not a prior tenant. All
+pre-registered tests below are on hold until the box is remediated (preferably
+reimaged, since a root rootkit makes any on-box reading — including a "clean" idle
+— untrustworthy) and re-characterized from scratch. No pcieburn data has been
+taken on this platform; none should be until then.
+
 **Pre-registered tests and predictions** (value is in falsifying die-level
 explanations; this platform has none of our marginal slots):
 
