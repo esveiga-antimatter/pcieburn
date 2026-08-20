@@ -35,6 +35,11 @@ DATA = [
     ("rgca18", 1132, 397, 0, 600.0, 0), ("rgca18", 1395, 359, 0, 600.0, 0),
     ("rgca18", 2068, 387, 0, 600.0, 0), ("rgca18", 2833, 318, 0, 600.0, 0),
     ("rgca18", 6971, 522, 0, 598.2, 1), ("rgca18",  222, 417, 1, 609.0, 1),
+    # batch of 2026-08-19/20: up1h idle test + baseline-uncapped up700s rerun
+    ("cor04",  4082, 438, 5, 600.0, 0),   # pl450-8192 @1h idle: clean
+    ("cor04",   812, 494, 5,  65.6, 1),   # baseline rerun @~700s: FAULT (GPU0, ERR_FATAL)
+    ("rgca17", 4078, 417, 0, 600.0, 0), ("rgca17",  807, 397, 0, 600.0, 0),
+    ("rgca18", 4078, 417, 2, 600.0, 0), ("rgca18",  839, 394, 2, 600.0, 0),
 ]
 NODES = ["cor04", "rgca17", "rgca18"]
 A_GRID  = [(-14.0 + 0.5 * i) for i in range(21)]          # ln base hazard /s

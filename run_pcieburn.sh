@@ -192,7 +192,13 @@ say "uptime at start: $UPTIME_H (booted $BOOT_UTC)"
     # verdict, so an artifact bundle is self-describing. v2 added the settle
     # window and made link degradation gate the verdict; a v1 bundle's "clean"
     # is a weaker claim than a v2 bundle's.
-    echo "wrapper_version   : 2"
+    # v3: the degraded-link verdict is computed from load-window samples only.
+    # v2 counted the whole trace, so pre-load idle at gen1 (RGCA links idle at
+    # gen1 and switch-node prep takes ~35 s) plus the settle window's post-load
+    # idle exceeded the 20 s dwell limit on EVERY switch-node run — four uniform
+    # all-8-GPU false DEGRADED verdicts before it was caught. Uniform dwell on
+    # all GPUs is the signature of that artifact; real degradation is per-link.
+    echo "wrapper_version   : 3"
     echo "settle_seconds    : $SETTLE_SECONDS"
     echo "uptime_seconds    : $UPTIME_S"
     echo "uptime_human      : $UPTIME_H"
@@ -618,6 +624,7 @@ say "START $(ts_iso)"
 # through tee: in a pipeline $! is tee's pid, and the cleanup trap must be able
 # to signal the supervisor itself. pcieburn line-buffers its own output, so a
 # hang still leaves a log whose last line carries a usable timestamp.
+LOAD_T0=$(date +%s)
 "$BIN" "${ARGS[@]}" > "$CONSOLE" 2>&1 &
 BURN_PID=$!
 tail -f --pid="$BURN_PID" -n +1 "$CONSOLE" 2>/dev/null &
@@ -625,6 +632,7 @@ TAIL_PID=$!
 
 wait "$BURN_PID"
 RC=$?
+LOAD_T1=$(date +%s)
 BURN_PID=""
 wait "$TAIL_PID" 2>/dev/null || true
 TAIL_PID=""
@@ -715,6 +723,30 @@ if [[ -s "$NVML" ]]; then
     #                 it logged 8018 BadTLP. Threshold is expressed in seconds and
     #                 converted using this run's own NVML interval.
     GEN_DWELL_MAX_S=20
+    # Aggregate ONLY samples inside the load window [LOAD_T0+5s, LOAD_T1] so
+    # idle-at-gen1 before launch and during the settle window cannot count
+    # toward dwell. Requires gawk mktime; if unavailable, falls back to the
+    # full-trace table (over-sensitive, never under-sensitive).
+    LINKSTATES_LOAD="$RUNDIR/pcie_link_states_load.txt"
+    if command -v gawk >/dev/null 2>&1 && [[ -n "${LOAD_T0:-}" && -n "${LOAD_T1:-}" ]]; then
+        gawk -F',' -v t0="$((LOAD_T0 + 5))" -v t1="$LOAD_T1" '
+            NR > 1 && NF >= 8 {
+                split($1, dt, " "); gsub(/[\/:]/, " ", dt[1]); gsub(/:/, " ", dt[2])
+                split(dt[2], tm, " ")
+                ep = mktime(dt[1] " " tm[1] " " tm[2] " " int(tm[3]))
+                if (ep < t0 || ep > t1) next
+                gpu = $2 + 0; gen = $7 + 0; width = $8 + 0
+                if (gen == 0 && width == 0) next
+                key = sprintf("gpu%d\tgen%d\tx%d", gpu, gen, width)
+                if (!(key in seen)) { seen[key] = 1; order[++n] = key }
+                count[key]++
+            }
+            END {
+                for (i = 1; i <= n; i++)
+                    printf "%s\tsamples=%d\n", order[i], count[order[i]]
+            }' "$NVML" 2>/dev/null | sort > "$LINKSTATES_LOAD" || true
+    fi
+    [[ -s "$LINKSTATES_LOAD" ]] || cp "$LINKSTATES" "$LINKSTATES_LOAD" 2>/dev/null || true
     DEGRADED_LINK=0
     DEGRADED_WHAT=""
     DEGRADED_WHAT=$(awk -F'\t' -v ivl="$NVML_INTERVAL_MS" -v maxs="$GEN_DWELL_MAX_S" '
@@ -735,7 +767,7 @@ if [[ -s "$NVML" ]]; then
                 if (slow[gpu] > lim)
                     printf "%s dwelt below gen5 for %d samples (%.0fs, limit %ds); ",
                            gpu, slow[gpu], slow[gpu] * ivl / 1000, maxs
-        }' "$LINKSTATES" 2>/dev/null)
+        }' "$LINKSTATES_LOAD" 2>/dev/null)
     [[ -n "$DEGRADED_WHAT" ]] && DEGRADED_LINK=1
 fi
 : "${DEGRADED_LINK:=0}"
