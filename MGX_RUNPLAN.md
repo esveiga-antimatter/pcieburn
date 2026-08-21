@@ -9,11 +9,11 @@ anything drifts.
 Two standing constraints on this platform: **driver 595, kernel 6.8 generic**,
 neither ours to change.
 
-> **Open issue, 2026-08-21.** The first run on this box reported an
-> **uncorrectable ECC error at iteration 0**. That is a memory-subsystem fault,
-> not a link fault, and it must not be folded into the PCIe corpus — but it does
-> mean the box is not yet a clean comparison platform. **Work through
-> "ECC triage" below before running any arm in this plan.**
+> **RESOLVED, 2026-08-22: GPU `0000:99:00.0` is an RMA.** The first run hit an
+> uncorrectable DRAM error at iteration 0. Diagnosis is unambiguous and is not a
+> test result — the card arrived degraded. See section 0b. Until it is replaced,
+> run the **six-GPU pair-preserving** configuration described there, never a
+> seven-GPU one.
 
 ---
 
@@ -38,7 +38,112 @@ That toggle is worth more than any single arm below.
 
 ---
 
-## 0b. ECC triage — blocking, do this before any arm
+## 0b. ECC triage — CLOSED: `99:00.0` is a hard RMA
+
+### The diagnosis, 2026-08-22
+
+One GPU, `0000:99:00.0`. The other seven are pristine — all counters zero, full
+512-bank remap budget.
+
+| reading | value | meaning |
+|---|---|---|
+| Volatile DRAM Uncorrectable | 297 | this boot |
+| **Aggregate DRAM Uncorrectable** | **58,250** | **InfoROM-backed lifetime count — survives reboots** |
+| Remapped Rows, Uncorrectable | 8 | eight rows already spent |
+| **Remapping Failure Occurred** | **Yes** | a remap was attempted and could not be satisfied |
+| Bank Remap Availability | Max 511, **None 1** | **one bank has zero spare rows left** |
+| Pending (remap / channel / TPC) | No | nothing left to apply — "reset and retry" is not a remedy |
+| Xid 48 | `physAddr 0x2ced1840 partition 5, subpartition 2` | uncorrectable double-bit error in the framebuffer |
+| Xid 171 | `GDDR, Uncorrectable DRAM error in FBPA 5 subpartition 2` | same address, named at the GDDR device |
+| Xid 64 | `All reserved rows for bank are remapped` | the self-repair path is exhausted |
+
+**This card was degraded before we touched it.** Aggregate is lifetime and
+persists across reboots; volatile resets at driver load. Even crediting all 297
+volatile errors to our run, roughly **57,950 uncorrectable DRAM errors and the
+eight consumed row remaps predate it.** A 600 s arm did not cause this and could
+not have.
+
+**It is not repairable.** `Remapping Failure Occurred: Yes` together with a bank
+at `None` availability means the row remapper has run out of spare rows for that
+bank, and `Pending: No` means there is nothing queued to apply. Address
+`0x2ced1840` in FBPA 5 / subpartition 2 will keep failing across every reset and
+every reboot. RMA the card.
+
+One oddity worth not over-reading: `Unrepairable Memory : No` sits alongside a
+failed remap and an exhausted bank. That field evidently has a narrower meaning
+than the plain English suggests. Trust the remapper histogram and Xid 64 over it.
+
+**Nothing here touches the PCIe investigation.** The fault is in a framebuffer
+partition, a different subsystem from the link. Worth noting from the same dump:
+`Aggregate Uncorrectable SRAM Sources → SRAM PCIE` reads **0 on all eight GPUs**,
+including the bad one — a small clean negative for the PCIe-adjacent SRAM on this
+platform, and the only line in the output that bears on the link at all.
+
+**No data corruption.** The eight `Xid 48 … pid=…, name=pcieburn, channel 0x4–0xb`
+lines are the driver tearing down the process's channels. ECC detected the error
+and killed the work rather than letting bad data through, which is what ECC is
+for. Confirm from the bundle, and expect zeros:
+
+```sh
+D=$(ls -1dt ~/pcieburn/runs/*/ | head -1)
+awk -F, 'NR==1 || $11+0>0 || $12+0>0' "$D/events.csv" | head   # 11=faulty, 12=nans
+```
+
+If those are zero, the investigation's standing claim — no data corruption ever
+observed, now 38 fleet runs plus this one — is untouched, and in fact slightly
+strengthened: the one platform with hardware ECC caught a real memory fault
+immediately, so the fleet's zeros are a working detector returning negative
+rather than an absence of looking.
+
+### Running the box with a dead GPU — get the exclusion right
+
+**Do not run seven GPUs.** This platform's topology class is *four PCIe switches
+with two GPUs each*. From the enumeration order (`1A, 1B, 3F, 40, 99, 9A, BB, BC`)
+the bad card is one half of a pair, and dropping only it leaves its partner alone
+behind that switch — which changes that switch's uplink loading, not just the
+rank count. A seven-GPU run is a different topology, not a smaller one.
+
+**Run six, excluding the whole pair** (`99:00.0` + `9A:00.0`). That preserves
+three symmetric pairs and is a defensible, self-consistent arm.
+
+**Exclude by UUID, not by index.** `pcieburn` calls `cudaSetDevice()` straight on
+the `--gpus` index and never logs a bus ID, and CUDA's default enumeration is
+`FASTEST_FIRST`, not PCI order — so the index you pass is not guaranteed to be
+the card you mean. `CUDA_VISIBLE_DEVICES` accepts UUIDs, which removes the
+question entirely:
+
+```sh
+nvidia-smi --query-gpu=index,pci.bus_id,uuid --format=csv     # get the UUIDs
+# then, for every arm, keeping the three healthy pairs:
+export CUDA_DEVICE_ORDER=PCI_BUS_ID          # belt and braces
+export CUDA_VISIBLE_DEVICES=GPU-<1a>,GPU-<1b>,GPU-<3f>,GPU-<40>,GPU-<bb>,GPU-<bc>
+```
+
+pcieburn then sees six devices and needs no `--gpus` at all. Remember `sudo -E`
+so the wrapper inherits it, and label the arm accordingly — **a six-GPU run is
+its own arm and must never be compared against an eight-GPU one.** Record the
+exclusion and the reason in the sidecar.
+
+Unaffected either way: the `--gpus 0,1` PIX-pair cells in section 6, as long as
+they use a healthy pair.
+
+### The process lesson
+
+This is the **second consecutive MGX unit to arrive in a state materially
+different from how it was described** — the first with a root rootkit and seven
+miners, this one with ~58k lifetime uncorrectable DRAM errors and an exhausted
+remap budget. Neither was visible without looking.
+
+`mgx_preflight.sh` now has an **arrival gate** that fails loudly on any nonzero
+aggregate uncorrectable count, any remap failure, any pending repair, or any bank
+at `None` availability. It would have caught this in seconds from the aggregate
+counters alone, before a 600 s arm was spent finding it. Run the gate on arrival
+for every borrowed machine, and treat aggregate ECC counters as an **acceptance
+check**, distinct from the volatile counters you read after a run.
+
+---
+
+## 0c. If you still need the original triage steps
 
 An uncorrectable ECC error is a **different subsystem** from the PCIe link fault
 this investigation is about. It gets triaged on its own terms and kept out of the

@@ -1040,9 +1040,70 @@ re-taken on the replacement unit. h13 no longer needs it either way — the mask
 question was resolved directly on fleet hardware from the kernel's own register
 dumps (see the full-corpus re-read).
 
-**The replacement is a clean, identical unit.** Same 8x RTX PRO 6000 Blackwell
-Server configuration. Two constraints are fixed and not ours to change:
-**driver 595, kernel 6.8 generic.**
+**The replacement unit also arrived degraded, differently.** Same 8x RTX PRO 6000
+Blackwell Server configuration, `mgxintel-CG480-S5063`. Two constraints are fixed
+and not ours to change: **driver 595.91.07 / CUDA 13.2, kernel 6.8 generic.**
+
+The first `pcieburn` run on it took an **uncorrectable DRAM ECC error at
+iteration 0** on GPU `0000:99:00.0`. The other seven GPUs are pristine — every
+counter zero, full 512-bank remap budget. The diagnosis is not a test result:
+
+| reading | value |
+|---|---|
+| Volatile DRAM Uncorrectable | 297 (this boot) |
+| **Aggregate DRAM Uncorrectable** | **58,250** — InfoROM-backed lifetime, survives reboots |
+| Remapped Rows, Uncorrectable | 8 |
+| **Remapping Failure Occurred** | **Yes** |
+| Bank Remap Availability | Max 511, **None 1** — one bank has no spare rows left |
+| Pending (remap / channel / TPC) | No — nothing queued, so a reset is not a remedy |
+| `Xid 48` | `physAddr 0x2ced1840 partition 5, subpartition 2` |
+| `Xid 171` | `GDDR, Uncorrectable DRAM error in FBPA 5 subpartition 2` |
+| `Xid 64` | `All reserved rows for bank are remapped` |
+
+**The card was degraded before we touched it, and it is unrepairable.** Aggregate
+is lifetime; volatile resets at driver load. Crediting all 297 volatile errors to
+our run still leaves ~57,950 uncorrectable DRAM errors and the eight consumed row
+remaps predating it — a 600 s arm did not and could not cause that. And with a
+failed remap plus a bank at `None` availability plus nothing pending, the
+hardware's self-repair path is exhausted for that bank: `0x2ced1840` fails
+permanently, across every reset. **RMA.** (`Unrepairable Memory : No` reads
+alongside all of that, so that field's meaning is narrower than its name; trust
+the remapper histogram and `Xid 64` over it.)
+
+**This is a memory-subsystem fault and does not belong in the PCIe corpus.** The
+failure is in a framebuffer partition, not the link. The only line in the dump
+that bears on the link is a clean negative: `Aggregate Uncorrectable SRAM Sources
+→ SRAM PCIE` reads **0 on all eight GPUs**, the bad one included.
+
+**No data corruption, and the standing claim is slightly strengthened.** The
+`Xid 48 … name=pcieburn, channel 0x4–0xb` lines are the driver tearing down the
+process's channels — ECC detected and killed the work rather than passing bad
+data through. The fleet's 5090s have no ECC, so a memory fault there is
+detectable only through `pcieburn`'s own GEMM comparison, which has read
+`faulty=0 nan=0` in 38 of 38 runs. The one platform that *does* have hardware ECC
+caught a real memory fault immediately, which makes those 38 zeros a working
+detector returning negative rather than an absence of looking.
+
+**Consequence for the plan.** Until the card is replaced, run the **six-GPU
+pair-preserving** configuration: this platform's topology class is four switches
+with two GPUs each, so dropping only the bad card leaves its partner alone behind
+that switch and changes that switch's uplink loading. A seven-GPU run is a
+different topology, not a smaller one. Exclude the whole pair (`99:00.0` +
+`9A:00.0`) **by UUID via `CUDA_VISIBLE_DEVICES`, not by index via `--gpus`** —
+`pcieburn` calls `cudaSetDevice()` straight on the index, never logs a bus ID,
+and CUDA's default enumeration is `FASTEST_FIRST` rather than PCI order. A
+six-GPU run is its own arm and must never be compared against an eight-GPU one.
+
+**Process lesson: acceptance-test borrowed hardware, and treat aggregate ECC
+counters as the arrival check.** Two consecutive MGX units have arrived in a
+state materially different from how they were described — the first with a root
+rootkit and seven miners, this one with ~58k lifetime uncorrectable DRAM errors
+and an exhausted remap budget. Neither was visible without looking.
+`mgx_preflight.sh` now fails a loud **arrival gate** on any nonzero aggregate
+uncorrectable count, any remap failure, any pending repair, or any bank at `None`
+availability; it would have caught this in seconds, before a 600 s arm was spent
+discovering it. Aggregate counters are an acceptance check and are distinct from
+the volatile counters read after a run.
 
 **Never pool this box's numbers with cor04/RGCA data.** It differs on every axis
 at once: same GB202 die (CC 12.0, so `SM ?= 120` in the Makefile is already
@@ -1650,6 +1711,18 @@ fatal containment 8.8 s after the load ended — 5 s after the wrapper's last
 `dmesg_after` snapshot. An entire conclusion ("massive correctable storm with no
 escalation") was built on that false negative and had to be withdrawn. Bound every
 clean verdict by checking the *next* run's `dmesg_before`, which covers the gap.
+
+**Separate lifetime counters from this-run counters before attributing anything
+to your own test.** The replacement MGX unit's first run ended in an
+uncorrectable DRAM error, which reads like "the load broke it in zero seconds"
+until you notice the *aggregate* counter is InfoROM-backed and survives reboots:
+58,250 lifetime uncorrectable errors and eight already-consumed row remaps
+against 297 in the current boot. The card arrived that way. Every counter in the
+stack needs this question asked of it — volatile versus aggregate for ECC,
+delta-over-the-run versus cumulative for AER — and the lifetime figure is an
+**acceptance check to run on arrival**, not a post-run reading. Borrowed hardware
+especially: two consecutive units here arrived materially unlike their
+description.
 
 **A missing artifact is a louder signal than a bad one — audit for absence, not
 just for content.** The corpus's second false negative was found by scanning for

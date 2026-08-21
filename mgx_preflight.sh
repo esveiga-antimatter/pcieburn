@@ -161,10 +161,56 @@ if have nvidia-smi; then
             say "    ABSENT: $f"
         fi
     done
+    # --- ARRIVAL GATE -----------------------------------------------------
+    # AGGREGATE counters are InfoROM-backed and survive reboots, so they are the
+    # card's whole history, not this run's. That makes them an ACCEPTANCE check
+    # to run on arrival, before any load — which is the lesson from the
+    # replacement MGX unit: it showed 58,250 aggregate uncorrectable DRAM
+    # errors, 8 rows already remapped and a bank with zero remap budget left,
+    # all of it predating our first run. Printing the numbers was not enough;
+    # nothing gated on them, so a 600 s arm was spent discovering it.
+    GATE_FAIL=0
+    if [[ -s "$OUT/ecc.txt" ]]; then
+        agg_unc=$(awk '/Aggregate/,/Aggregate Uncorrectable SRAM Sources/' "$OUT/ecc.txt" \
+                  | grep -E 'Uncorrectable' | grep -oE '[0-9]+$' | awk '{s+=$1} END{print s+0}')
+        [[ "${agg_unc:-0}" -gt 0 ]] && GATE_FAIL=1
+        grep -q 'Unrepairable Memory *: *Yes'  "$OUT/ecc.txt" && GATE_FAIL=1
+        grep -q 'Repair Pending *: *Yes'       "$OUT/ecc.txt" && GATE_FAIL=1
+        grep -q 'SRAM Threshold Exceeded *: *Yes' "$OUT/ecc.txt" && GATE_FAIL=1
+    fi
+    if [[ -s "$OUT/row_remapper.txt" ]]; then
+        grep -q 'Remapping Failure Occurred *: *Yes' "$OUT/row_remapper.txt" && GATE_FAIL=1
+        grep -q 'Pending *: *Yes'                    "$OUT/row_remapper.txt" && GATE_FAIL=1
+        # a bank with "None" remap availability has exhausted its spare rows:
+        # nothing — not a reset, not a reboot — brings that bank back.
+        awk '/None *: *[1-9]/ {found=1} END{exit !found}' "$OUT/row_remapper.txt" && GATE_FAIL=1
+    fi
     say ""
-    say "  Any nonzero UNCORRECTABLE count, or any pending row remap, means this"
-    say "  box is not a clean comparison platform until it is resolved. Localise"
-    say "  it with 'dcgmi diag -r 2' before running any pcieburn arm."
+    if [[ $GATE_FAIL -eq 1 ]]; then
+        say "  ##################################################################"
+        say "  #  ARRIVAL GATE FAILED — this box is NOT a clean comparison       #"
+        say "  #  platform. Do not run any pcieburn arm on it yet.              #"
+        say "  ##################################################################"
+        say "  Offending readings:"
+        grep -nE 'Unrepairable Memory *: *Yes|Repair Pending *: *Yes|SRAM Threshold Exceeded *: *Yes' \
+            "$OUT/ecc.txt" 2>/dev/null | sed 's/^/    ecc.txt:/'
+        grep -nE 'Remapping Failure Occurred *: *Yes|Pending *: *Yes|None *: *[1-9]' \
+            "$OUT/row_remapper.txt" 2>/dev/null | sed 's/^/    row_remapper:/'
+        say "    aggregate uncorrectable total across all GPUs: ${agg_unc:-?}"
+        say ""
+        say "  Read it this way:"
+        say "    - AGGREGATE nonzero  = the card's lifetime history. If this is"
+        say "      large on arrival, the part was degraded before you got it."
+        say "    - 'Remapping Failure Occurred: Yes' plus a bank at 'None' means"
+        say "      the row remapper is OUT OF SPARE ROWS for that bank. No reset"
+        say "      and no reboot recovers it. That address fails permanently."
+        say "    - 'Pending: No' alongside those means there is nothing left to"
+        say "      apply, so 'reset and retry' is not a remedy here."
+        say "  Identify the GPU, RMA it, and see MGX_RUNPLAN.md section 0b."
+    else
+        say "  ARRIVAL GATE PASSED — no uncorrectable history, no remap failures,"
+        say "  full remap budget on every bank."
+    fi
 else
     say "  nvidia-smi not present — ECC section unavailable"
 fi
