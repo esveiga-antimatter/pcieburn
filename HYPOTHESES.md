@@ -1029,28 +1029,40 @@ rate ratio is 11.2×. **No run in the corpus exceeded 642 s of load**, so every
 
 ## Third platform: intelmgx-CG480 (8x RTX PRO 6000 Blackwell Server)
 
-**Unit history.** The first loaner was found on 2026-08-20 to be running seven
-root-owned cryptominer processes hidden from `nvidia-smi --query-compute-apps`
-— i.e. NVML process enumeration was hooked — and was swapped out. **That unit
-produced no `pcieburn` data, and none of its readings carry over**, including
-the `CEMsk all clear` observation that h13 was leaning on: a root rootkit makes
-any on-box reading untrustworthy, the "leftover 430 W cap from a prior tenant"
-was the miner, and the machine is gone. Every arrival observation below must be
-re-taken on the replacement unit. h13 no longer needs it either way — the mask
-question was resolved directly on fleet hardware from the kernel's own register
-dumps (see the full-corpus re-read).
+**Unit history — one machine, not two.** `mgxintel-CG480-S5063` was found on
+2026-08-20 running seven root-owned cryptominer processes hidden from
+`nvidia-smi --query-compute-apps` (NVML process enumeration was hooked). It was
+**not** swapped: the disk was formatted and the box reused. Same chassis, same
+eight cards. Two constraints are fixed and not ours to change: **driver
+595.91.07 / CUDA 13.2, kernel 6.8 generic.**
 
-**The replacement unit, `mgxintel-CG480-S5063`.** Same 8x RTX PRO 6000 Blackwell
-Server configuration. Two constraints are fixed and not ours to change:
-**driver 595.91.07 / CUDA 13.2, kernel 6.8 generic.**
+**A reimage clears the disk, not the hardware's persistent state.** InfoROM,
+VBIOS and BMC configuration all survive a format, and the attacker had root.
+Readings taken while the rootkit was resident stay untrustworthy — including the
+`CEMsk all clear` observation h13 was leaning on, and the "leftover 430 W cap
+from a prior tenant" which was the miner. Re-take every arrival observation.
+Checked so far: VBIOS `98.02.67.00.0A` and board part `900-2G153-0000-000` are
+identical across all eight cards, and InfoROM image `G153.0210.00.02` / ECC
+object `7.16` are uniform with no corruption flags, so the ECC counters are
+trustworthy and there is no sign of firmware tampering. BMC firmware and settings
+are still unverified. h13 no longer depends on this box either way — the mask
+question was resolved on fleet hardware from the kernel's own register dumps (see
+the full-corpus re-read).
 
-**GPU `0000:99:00.0` is out of service pending RMA** — an unrepairable
-framebuffer defect, found on the first run and predating it. It is a
-memory-subsystem fault and bears on no hypothesis here; the operational
-consequence is in `MGX_RUNPLAN.md` section 0b. **The pre-registered arms below
-were written for eight GPUs and will run on six** (three PIX pairs, the bad
-GPU's partner excluded with it), so they are not comparable to an eight-GPU run
-and must be labelled as their own arm.
+**GPU `0000:99:00.0` is out of service pending RMA** — 58,250 lifetime
+uncorrectable DRAM errors, 8 remapped rows, and one bank with no spare rows left,
+so the defect is unrepairable. It is a memory-subsystem fault and bears on no
+hypothesis here; the operational consequence is in `MGX_RUNPLAN.md` section 0b.
+Attribution to the crypto incident is **not** established: the miner ran on all
+eight cards and the other seven are pristine with full remap budgets, so the
+workload alone does not explain damage on one. Either that card was already the
+weak one or its slot is thermally disadvantaged, and the memory-temperature
+comparison across the eight is what separates those. Note also that the format
+destroyed the on-disk evidence of how long the miner had been running.
+
+**The pre-registered arms below were written for eight GPUs and will run on six**
+(three PIX pairs, the bad GPU's partner excluded with it), so they are not
+comparable to an eight-GPU run and must be labelled as their own arm.
 
 **Signal for the corpus-wide "no data corruption" claim.** The fleet's 5090s are
 consumer parts with no ECC, so a memory fault there is detectable only through
