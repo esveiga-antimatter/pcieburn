@@ -1029,64 +1029,221 @@ rate ratio is 11.2×. **No run in the corpus exceeded 642 s of load**, so every
 
 ## Third platform: intelmgx-CG480 (8x RTX PRO 6000 Blackwell Server)
 
+**Unit history.** The first loaner was found on 2026-08-20 to be running seven
+root-owned cryptominer processes hidden from `nvidia-smi --query-compute-apps`
+— i.e. NVML process enumeration was hooked — and was swapped out. **That unit
+produced no `pcieburn` data, and none of its readings carry over**, including
+the `CEMsk all clear` observation that h13 was leaning on: a root rootkit makes
+any on-box reading untrustworthy, the "leftover 430 W cap from a prior tenant"
+was the miner, and the machine is gone. Every arrival observation below must be
+re-taken on the replacement unit. h13 no longer needs it either way — the mask
+question was resolved directly on fleet hardware from the kernel's own register
+dumps (see the full-corpus re-read).
+
+**The replacement is a clean, identical unit.** Same 8x RTX PRO 6000 Blackwell
+Server configuration. Two constraints are fixed and not ours to change:
+**driver 595, kernel 6.8 generic.**
+
 **Never pool this box's numbers with cor04/RGCA data.** It differs on every axis
-at once: same GB202 die but the PRO SKU (more SMs, 600 W default), dual-socket
-Intel MGX host, **four PCIe switches with two GPUs each** (PIX pairs 0/1, 2/3,
-4/5, 6/7 across two NUMA domains — a third topology class, blast radius 2),
-**P2P enabled on all pairs**, driver 595.91.07 / CUDA 13.2 vs the fleet's 580,
-and — critically — **firmware-first error handling**: every host bridge reports
-`_OSC: platform does not support [AER DPC]`, GHES/APEI is on, no port has
-kernel-managed DPC, and recovery would go through EDR.
+at once: same GB202 die (CC 12.0, so `SM ?= 120` in the Makefile is already
+correct and the binary builds unchanged) but the PRO SKU (more SMs, 600 W
+default), dual-socket Intel MGX host, **four PCIe switches with two GPUs each**
+(PIX pairs 0/1, 2/3, 4/5, 6/7 across two NUMA domains — a third topology class,
+blast radius 2), **P2P enabled on all pairs**, driver 595 / CUDA 13.2 against the
+fleet's 580, **kernel 6.8 against the fleet's 7.0.0-28/-29**, and — critically —
+**firmware-first error handling**: every host bridge reports `_OSC: platform does
+not support [AER DPC]`, GHES/APEI is on, no port has kernel-managed DPC, and
+recovery would go through EDR.
 
-**Observability consequence:** `aer_delta.txt` is structurally blind here — the
-OS never receives native AER events, so zero counters mean nothing. The
-observables on this box are kernel GHES/CPER (`Hardware Error` lines, rasdaemon)
-and the **BMC SEL** (`ipmitool sel list` bracketed around every run). This is
-also the native configuration for the fleet's original PERR/SERR symptom — the
-BMC sees errors first by design — so any event here exercises the exact
-misinterpretation chain the investigation started from. Its power telemetry is
-healthy where the fleet's is broken (`PSU*_POWER_OUT` unsaturated at >1 kW,
-`PSU*_IOUT`, and an ambient sensor `PSU1_AMB_TEMP`), and the driver exposes
-`temperature.gpu.tlimit` plus `clocks_event_reasons_counters.*` — cumulative
-seconds under each throttle cause, a rigorous replacement for the clip% proxy.
+That kernel difference is now load-bearing rather than incidental: the
+full-corpus re-read found that cor04's `-28` → `-29` change separates its long-
+and short-TTF faults perfectly. **Do not try to settle that question here.**
+Kernel 6.8 is a third point on that axis with the die, board, host, topology,
+driver and error path all moving with it. It still needs the cor04 downgrade run.
 
-Baseline state found on arrival: links uniformly clean (gen5 x16, ASPM disabled,
-no training anomalies), endpoint `CEMsk` all clear (spec default — nothing
-masked, see h13), a leftover 430 W power limit from a prior tenant (reset and
-record), and a prior workload that ended before our runs.
+### What the harness loses on this platform, and it loses it silently
 
-**BLOCKED — box is compromised (found 2026-08-20).** nvtop revealed seven
-root-owned cryptominer processes (masquerading as `systemd-update-helper --coin
-pearl -o hk.pearl...`, ~2122 MiB and 15–29% on every GPU) that are hidden from
-`nvidia-smi --query-compute-apps` — i.e. NVML process enumeration is hooked. The
-430 W cap and 429 W draw noted on arrival were this miner, not a prior tenant. All
-pre-registered tests below are on hold until the box is remediated (preferably
-reimaged, since a root rootkit makes any on-box reading — including a "clean" idle
-— untrustworthy) and re-characterized from scratch. No pcieburn data has been
-taken on this platform; none should be until then.
+Both gaps are in the wrapper, not the binary.
 
-**Pre-registered tests and predictions** (value is in falsifying die-level
-explanations; this platform has none of our marginal slots):
+| measurement | what happens here | why |
+|---|---|---|
+| `aer_delta.txt` — "the graded measurement" | **structurally zero** | `run_pcieburn.sh` reads `/sys/bus/pci/devices/*/aer_dev_correctable`. Under firmware-first the kernel never receives AER events, so those counters never increment. The file looks like a clean result. |
+| `psu_current.csv` | **absent** | the wrapper probes `CUR_PSU1_IOUT`, does not find it, warns and sets `WITH_PSU=0`. The one box with unsaturated PSU telemetry produces no PSU data. Its sensors are `PSU*_POWER_OUT`, `PSU*_IOUT`, `PSU1_AMB_TEMP`. |
 
-1. Calibration nulls — the two frozen arms (2048 mixed uncapped; 8192-single at
-   600 W), 600 s. *Predict: no fault, no SEL entry, no CPER.* Any GPU→upstream
-   correctable surfacing via SEL/CPER on clean pro hardware would promote h13
-   from "our boards" to GB202-generic; a fault would be larger news.
-2. P2P A/B — same arm with `NCCL_P2P_DISABLE=1` (fleet-matched host staging)
-   vs `0` (peer traffic), plus a `--gpus 0,1` PIX-pair cell where collective
-   traffic never leaves one switch. *Predict: no behavioral difference in fault
-   terms (bandwidth is exonerated); byte-accounting lines invalid under P2P
-   (`PCIE_HOST_STAGING_MULT` assumes staging — read as relative only).* With P2P
-   off, each switch uplink carries two GPUs' staged traffic — the highest
-   per-root-port load of any configuration yet run; the exoneration data says
-   it still does nothing.
-3. Power ladder 300/450/600 W with the T.Limit + throttle-counter sidecar.
-   Deliverable: edge-vs-worst-internal-sensor delta on GB202 under our GEMM
-   load, and exact seconds under `sw_power_cap`/`hw_power_brake`.
-4. Boot-training loop: ~8 reboots, `linkcheck.sh --csv` each boot pre-load.
-   *Predict (h10): zero training variance on this platform; variance is a
-   fleet BIOS/riser property, not GB202/driver.*
-5. `dcgmi diag -r 3` as the original-reproducer cross-check.
+What already works: the manifest section that records `_OSC` ownership,
+`DPC: enabled` counts and `Hardware Error` line counts.
+
+Required wrapper work before any arm is worth running:
+
+- a PSU sensor-name override so `--with-psu` can be pointed at this platform's
+  names, plus capture of `PSU1_AMB_TEMP`;
+- a **raw config-space** AER/Lane-Error poller, because sysfs is blind here.
+  Read the AER Capability's Correctable and Uncorrectable Error Status registers,
+  the Secondary PCIe Extended Capability's `Lane Error Status`, and the 32 GT/s
+  Physical Layer capability's own `Lane Error Status` and per-lane Lane
+  Equalization Control. **Enumerate the capability offsets from `lspci -vvv` on
+  the target rather than reciting them** — that mistake has been made here
+  before. Status registers latch regardless of who owns *reporting*, so this
+  works under firmware-first; the risk is that the BIOS SMI handler clears them
+  after handling and races the poller.
+- **Validate that poller on a fleet node first**, where the OS-first sysfs
+  counters give ground truth. If it agrees with `aer_delta.txt` on cor04's
+  `00:01.1`, a zero here means something. Without that calibration it does not —
+  which is exactly the discipline item this investigation already owns.
+
+### The check to make before spending a single run
+
+`_OSC` AER/DPC ownership is a **BIOS setting** on the fleet: it differed between
+COR04 and RGCA with identical board and identical BIOS version, and RGCA was
+subsequently switched to OS-first. If it is settable on this platform too,
+flipping to OS-first would restore `aer_delta.txt` and the per-device counters,
+make DPC kernel-managed so containment scope and reporting match the fleet, and
+make every number here directly comparable instead of "same die, different error
+path."
+
+And because it is *reversible*, it becomes a test the fleet cannot do cleanly:
+**firmware-first vs OS-first on identical hardware under identical load, one
+variable.** That is a direct probe of what is left of h11 — the IOMMU limb is
+refuted, and this isolates the error-handling-path limb without needing a
+passthrough guest. If firmware-first silently absorbs what OS-first escalates to
+a contained GPU, that is a candidate mechanism for hivenet's zero-downtime
+record and for the monitoring-blindness branch, measured rather than argued.
+
+**This may be the box's most valuable property — more than its board.** Rank it
+above the board arms if the setting exists.
+
+### Verify on the box, do not assume
+
+Kernel 6.8 with driver 595 is an unusual pairing; three things gate the plan and
+all three are cheap to check.
+
+1. **`CONFIG_PCIE_EDR`** in `/boot/config-$(uname -r)`. Firmware-first
+   containment recovery goes through EDR; if it is not compiled in, a contained
+   link is not OS-recoverable at all and "fault" means something different here.
+2. **Driver 595 field availability** — `nvidia-smi --help-query-gpu | grep -E
+   'tlimit|clocks_event_reasons'`. The cooling arm below depends on
+   `clocks_event_reasons_counters.*` and `temperature.gpu.tlimit` existing.
+   Enumerate them; do not trust this file.
+3. **`ipmitool sdr list`** for the actual PSU and ambient sensor names on *this*
+   unit, before writing them into the wrapper.
+
+Also record `nvcc --version` per node. The manifest captures the driver but not
+the toolkit, so a CUDA 13.2 build will produce a different binary hash from the
+fleet's and the tag should say why — this is the "git matches, binary differs →
+toolchain differs" row, not a source difference. **Add `uname -r` to the
+manifest at the same time**; the fleet's kernel confound was invisible because
+nothing recorded it.
+
+### Matched flags are not matched stress
+
+The fleet already showed a 4.0x collective-throughput difference between cor04
+and RGCA on a *byte-identical* arm. Here, more SMs, a 600 W default instead of
+575 W, P2P on all pairs and a different CUDA all push the same flags somewhere
+else again.
+
+- **Run `NCCL_P2P_DISABLE=1` as the baseline, not as one arm of an A/B.**
+  Host-staged collectives are what put traffic on the PCIe link at all; with P2P
+  on the byte accounting is invalid (`PCIE_HOST_STAGING_MULT` assumes staging)
+  and the link carries something different. P2P-on becomes the secondary arm.
+- Match arms on **achieved** mean power, GEMM duty cycle and collective rate read
+  back out of the artifacts — never on flags.
+
+### Pre-registered tests and predictions
+
+Written before any run. The value here is mostly in falsifying die-level
+explanations; this platform has none of our marginal slots, and its predicted
+fault rate is low enough that **every arm must read out on a continuous
+observable, not on a verdict.** Bounding the hazard even 5x below cor04's would
+take 3 x 3600 s; a `clean` verdict here is worth almost nothing on its own.
+
+Readouts for every arm: per-link, per-direction correctable counts and per-lane
+`Lane Error Status` from config space; `clocks_event_reasons_counters.*`
+(cumulative seconds per throttle cause — the rigorous replacement for the clip%
+proxy, which failed at r = −0.04 against fault); `temperature.gpu.tlimit` margin;
+`PSU*_POWER_OUT` / `PSU*_IOUT` / `PSU1_AMB_TEMP`; kernel GHES/CPER via
+`rasdaemon`; `ipmitool sel list` bracketed around every run.
+
+1. **Baseline characterisation, zero load.** `linkcheck.sh` plus per-lane
+   `Lane Error Status` and 32 GT/s Lane Equalization Control on all eight links;
+   endpoint `CEMsk`; `_OSC` ownership; the three verification checks above; build
+   and hash the binary. *Predict: links uniformly gen5 x16, ASPM disabled, no
+   training anomalies, nothing masked.*
+2. **Direction asymmetry under the two frozen arms** (2048 mixed uncapped;
+   8192-single at 600 W), 600 s, `NCCL_P2P_DISABLE=1`. This is the highest-value
+   board test: same die, different board, different connector system.
+   *Predict: no fault, no SEL entry, no CPER.* The informative readout is the
+   correctable direction split, not the verdict:
+   - GPU→upstream correctables appear and upstream→GPU stays zero → the
+     asymmetry is **GB202/PHY-generic**, which retires card-local PHY supply
+     (mechanism 2) and connector TX-pin degradation (mechanism 3) as *necessary*
+     conditions and promotes die-side EQ drift (mechanism 1).
+   - zero in both directions → the asymmetry stays a 5090-board / fleet-connector
+     property, supporting mechanisms 2 and 3 and pointing at the VRM and CEM
+     connector rather than the die.
+   - errors in *both* directions → new phenomenon; different receiver silicon, so
+     treat as platform-specific and do not pool.
+3. **`_OSC` A/B**, if the setting exists: one arm, firmware-first vs OS-first,
+   identical hardware and load. *Predict (h11's surviving limb): OS-first
+   escalates to a contained GPU where firmware-first absorbs or retries.* Rank
+   this first if available.
+4. **Power x cooling 2x2 (or 3x2).** Power {300, 450, 600 W} x cooling {full fan,
+   reduced fan at fixed power}. **This subsumes the earlier power-ladder
+   pre-registration — run the ladder alone and it just re-creates the fleet's
+   power/ΔT collinearity on new hardware.** A passively-cooled server card with
+   BMC fan control is the only instrument in this investigation that can move ΔT
+   independently of power, which is what h16 has needed and the fleet
+   structurally cannot provide. *Predict: correctable and lane-error rate track
+   power, not ΔT, if mechanism 2 dominates; the reverse if mechanism 4 does.*
+   Deliverable either way: edge-vs-worst-internal-sensor delta on GB202 under our
+   GEMM load, and exact seconds under `sw_power_cap` / `hw_power_brake`.
+5. **Boot-training loop:** ~8 reboots, `linkcheck.sh --csv` each boot pre-load,
+   plus per-lane EQ coefficients each boot. *Predict (h10): zero training
+   variance on this platform; variance is a fleet BIOS/riser property, not
+   GB202/driver.* Cheap, no load time, sharpest prediction on the list.
+6. **P2P-on secondary arm and the `--gpus 0,1` PIX-pair cell** where collective
+   traffic never leaves one switch. *Predict: no behavioural difference in fault
+   terms.* **Downgraded from the earlier pre-registration.** The full-corpus
+   re-read strengthened the traffic exoneration considerably — cor04 ran 59% of
+   Gen5 x16 for 606 s twice with zero AER and no fault, and r(egress, fault) =
+   −0.18 across 37 runs. Run as a cheap null, not a priority.
+7. **`dcgmi diag -r 3`** as the original-reproducer cross-check.
+
+**Free calibration worth taking while the box is idle.** Log `PSU1_AMB_TEMP`
+alongside the pre-load idle-GPU-temperature proxy. If the proxy tracks a real
+ambient sensor here, the retroactive ambient figures that eliminated ambient as
+the mediator of the cor04 staircase gain independent support across all 38 fleet
+runs. One extra sensor read.
+
+### What this box cannot settle
+
+- **Absolute correctable rates are not comparable to the fleet.** h13 says errors
+  are detected at the *receiver* with the GPU transmitting, and this platform has
+  an entirely different receiver — Intel root complex, PIX switches, none of the
+  fleet's switch parts. Fewer errors here could mean a better receiver, not a
+  better transmitter. Only **within-platform dose-response shapes** and
+  **within-link asymmetries** transfer.
+- **A null does not clear the die.** Board, host, connector system, topology
+  class, driver *and* kernel all move at once. Failing to implicate GB202 is not
+  exonerating it.
+- **The fleet's kernel confound.** As above: not testable here.
+
+### The cross-board slot swap, and why it is not in the list above
+
+Putting a PRO 6000 into cor04's GPU5 slot (`a0:01.1` — three fatals, zero
+correctables ever) is the sharpest version of h6's swap, because it changes the
+board *class* rather than the serial number: the card dies again → slot, riser or
+connector; the card survives where three 5090 lifetimes ended → board.
+
+It is deliberately not pre-registered, because the risks are real and worth
+stating rather than discovering: a 600 W **passively cooled** card into a chassis
+designed for axial-fan cards, loaner hardware into a node that has hard-faulted
+seven times and needed a reboot each time, and mechanical fit in a
+`TURIN2D24G-2L+` chassis that has not been checked. **Do the intra-fleet
+5090↔5090 swap first** — same logic, no loaner exposure, and it tells you "slot"
+or "card" before anyone decides whether the cross-board version is worth it.
+
+---
+
 
 ## Tenant workload profile: hivenet's vLLM serving
 
@@ -1348,6 +1505,26 @@ ratio is the actual deliverable.
 15. **Log boot_utc per run and group by boot session, not by arm order.** cor04 had
     four boot sessions across seven arms because its faults forced reboots;
     assuming one boot per node produced a wrong collinearity claim.
+16. **Record `uname -r` and `nvcc --version` in the manifest.** cor04's kernel
+    changed `7.0.0-28` → `7.0.0-29` mid-campaign while both RGCA nodes stayed on
+    `-28`, and it separates cor04's long- and short-TTF faults perfectly — a
+    covariate that was invisible for the whole campaign because nothing recorded
+    it. The driver string is not sufficient: the NVIDIA module is rebuilt against
+    the new kernel while `NVRM version` stays the same. The toolkit version is
+    the other unrecorded one, and it is what makes two nodes on the same commit
+    produce different binary hashes.
+17. **Audit a batch for missing artifacts before reading any of its numbers.**
+    Check that every bundle has the same file list, that `verdict` and
+    `exit_code` are actually present, and that no file contains NUL bytes. The
+    corpus's second false negative was a bundle whose host died mid-run: six
+    NUL-truncated files, no `dmesg_after.txt`, no `faults.txt`, and a blank
+    `verdict` that every downstream parser read as clean. An absent verdict must
+    never fall through to "clean".
+18. **Match arms on achieved stress, not on flags.** Byte-identical flags gave a
+    4.0x collective-throughput difference between cor04 and RGCA, and will
+    diverge again on any new platform. Read mean power, GEMM duty cycle and
+    collective rate back out of the artifacts and compare *those* before calling
+    two runs the same arm.
 
 ---
 
