@@ -9,11 +9,8 @@ anything drifts.
 Two standing constraints on this platform: **driver 595, kernel 6.8 generic**,
 neither ours to change.
 
-> **RESOLVED, 2026-08-22: GPU `0000:99:00.0` is an RMA.** The first run hit an
-> uncorrectable DRAM error at iteration 0. Diagnosis is unambiguous and is not a
-> test result — the card arrived degraded. See section 0b. Until it is replaced,
-> run the **six-GPU pair-preserving** configuration described there, never a
-> seven-GPU one.
+> **2026-08-22:** GPU `0000:99:00.0` is out of service pending RMA. Run the
+> six-GPU pair-preserving configuration in section 0b, never a seven-GPU one.
 
 ---
 
@@ -38,210 +35,74 @@ That toggle is worth more than any single arm below.
 
 ---
 
-## 0b. ECC triage — CLOSED: `99:00.0` is a hard RMA
+## 0b. Config change: six GPUs, pair-preserving
 
-### The diagnosis, 2026-08-22
+GPU `0000:99:00.0` is out of service pending RMA.
 
-One GPU, `0000:99:00.0`. The other seven are pristine — all counters zero, full
-512-bank remap budget.
+**Exclude the whole PIX pair, not just the bad GPU.** The topology class is four
+switches with two GPUs each, so dropping only `99:00.0` leaves its partner alone
+behind that switch and changes that switch's uplink loading. Six GPUs in three
+symmetric pairs is a self-consistent arm; seven is a different topology.
 
-| reading | value | meaning |
-|---|---|---|
-| Volatile DRAM Uncorrectable | 297 | this boot |
-| **Aggregate DRAM Uncorrectable** | **58,250** | **InfoROM-backed lifetime count — survives reboots** |
-| Remapped Rows, Uncorrectable | 8 | eight rows already spent |
-| **Remapping Failure Occurred** | **Yes** | a remap was attempted and could not be satisfied |
-| Bank Remap Availability | Max 511, **None 1** | **one bank has zero spare rows left** |
-| Pending (remap / channel / TPC) | No | nothing left to apply — "reset and retry" is not a remedy |
-| Xid 48 | `physAddr 0x2ced1840 partition 5, subpartition 2` | uncorrectable double-bit error in the framebuffer |
-| Xid 171 | `GDDR, Uncorrectable DRAM error in FBPA 5 subpartition 2` | same address, named at the GDDR device |
-| Xid 64 | `All reserved rows for bank are remapped` | the self-repair path is exhausted |
-
-**This card was degraded before we touched it.** Aggregate is lifetime and
-persists across reboots; volatile resets at driver load. Even crediting all 297
-volatile errors to our run, roughly **57,950 uncorrectable DRAM errors and the
-eight consumed row remaps predate it.** A 600 s arm did not cause this and could
-not have.
-
-**It is not repairable.** `Remapping Failure Occurred: Yes` together with a bank
-at `None` availability means the row remapper has run out of spare rows for that
-bank, and `Pending: No` means there is nothing queued to apply. Address
-`0x2ced1840` in FBPA 5 / subpartition 2 will keep failing across every reset and
-every reboot. RMA the card.
-
-One oddity worth not over-reading: `Unrepairable Memory : No` sits alongside a
-failed remap and an exhausted bank. That field evidently has a narrower meaning
-than the plain English suggests. Trust the remapper histogram and Xid 64 over it.
-
-**Nothing here touches the PCIe investigation.** The fault is in a framebuffer
-partition, a different subsystem from the link. Worth noting from the same dump:
-`Aggregate Uncorrectable SRAM Sources → SRAM PCIE` reads **0 on all eight GPUs**,
-including the bad one — a small clean negative for the PCIe-adjacent SRAM on this
-platform, and the only line in the output that bears on the link at all.
-
-**No data corruption.** The eight `Xid 48 … pid=…, name=pcieburn, channel 0x4–0xb`
-lines are the driver tearing down the process's channels. ECC detected the error
-and killed the work rather than letting bad data through, which is what ECC is
-for. Confirm from the bundle, and expect zeros:
+**Verify the pair map on this unit before trusting it** — the 0/1, 2/3, 4/5, 6/7
+pairing on record was taken on the previous, compromised box:
 
 ```sh
-D=$(ls -1dt ~/pcieburn/runs/*/ | head -1)
-awk -F, 'NR==1 || $11+0>0 || $12+0>0' "$D/events.csv" | head   # 11=faulty, 12=nans
+nvidia-smi topo -m
+nvidia-smi --query-gpu=index,pci.bus_id,uuid --format=csv
 ```
 
-If those are zero, the investigation's standing claim — no data corruption ever
-observed, now 38 fleet runs plus this one — is untouched, and in fact slightly
-strengthened: the one platform with hardware ECC caught a real memory fault
-immediately, so the fleet's zeros are a working detector returning negative
-rather than an absence of looking.
-
-### Running the box with a dead GPU — get the exclusion right
-
-**Do not run seven GPUs.** This platform's topology class is *four PCIe switches
-with two GPUs each*. From the enumeration order (`1A, 1B, 3F, 40, 99, 9A, BB, BC`)
-the bad card is one half of a pair, and dropping only it leaves its partner alone
-behind that switch — which changes that switch's uplink loading, not just the
-rank count. A seven-GPU run is a different topology, not a smaller one.
-
-**Run six, excluding the whole pair** (`99:00.0` + `9A:00.0`). That preserves
-three symmetric pairs and is a defensible, self-consistent arm.
-
 **Exclude by UUID, not by index.** `pcieburn` calls `cudaSetDevice()` straight on
-the `--gpus` index and never logs a bus ID, and CUDA's default enumeration is
-`FASTEST_FIRST`, not PCI order — so the index you pass is not guaranteed to be
-the card you mean. `CUDA_VISIBLE_DEVICES` accepts UUIDs, which removes the
-question entirely:
+the `--gpus` index, never logs a bus ID, and CUDA enumerates `FASTEST_FIRST` by
+default rather than in PCI order, so an index is not a reliable handle on a
+specific card. Put this in the shell that launches every arm:
 
 ```sh
-nvidia-smi --query-gpu=index,pci.bus_id,uuid --format=csv     # get the UUIDs
-# then, for every arm, keeping the three healthy pairs:
-export CUDA_DEVICE_ORDER=PCI_BUS_ID          # belt and braces
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=GPU-<1a>,GPU-<1b>,GPU-<3f>,GPU-<40>,GPU-<bb>,GPU-<bc>
 ```
 
-pcieburn then sees six devices and needs no `--gpus` at all. Remember `sudo -E`
-so the wrapper inherits it, and label the arm accordingly — **a six-GPU run is
-its own arm and must never be compared against an eight-GPU one.** Record the
-exclusion and the reason in the sidecar.
+With that set, `pcieburn` sees six devices and needs no `--gpus`. Use `sudo -E`
+so the wrapper inherits it (already the case in every command below).
 
-Unaffected either way: the `--gpus 0,1` PIX-pair cells in section 6, as long as
-they use a healthy pair.
+**Label these as their own arm.** Add `-6gpu` to every tag and never compare a
+six-GPU run against an eight-GPU one. Note the exclusion and its reason in the
+sidecar.
 
-### The process lesson
+Unaffected: the `--gpus 0,1` PIX-pair cells in section 6, provided they use a
+healthy pair.
 
-This is the **second consecutive MGX unit to arrive in a state materially
-different from how it was described** — the first with a root rootkit and seven
-miners, this one with ~58k lifetime uncorrectable DRAM errors and an exhausted
-remap budget. Neither was visible without looking.
+## 0c. Added to the arrival procedure
 
-`mgx_preflight.sh` now has an **arrival gate** that fails loudly on any nonzero
-aggregate uncorrectable count, any remap failure, any pending repair, or any bank
-at `None` availability. It would have caught this in seconds from the aggregate
-counters alone, before a 600 s arm was spent finding it. Run the gate on arrival
-for every borrowed machine, and treat aggregate ECC counters as an **acceptance
-check**, distinct from the volatile counters you read after a run.
-
----
-
-## 0c. If you still need the original triage steps
-
-An uncorrectable ECC error is a **different subsystem** from the PCIe link fault
-this investigation is about. It gets triaged on its own terms and kept out of the
-fault corpus. Two reasons it still blocks everything: a card with a memory defect
-is not the clean same-die/different-board comparison the whole platform plan
-rests on, and if it recurs mid-arm it will terminate runs for a reason unrelated
-to what the arm is testing.
-
-### The one question that sets the severity
-
-Did `pcieburn`'s own GEMM comparison see corrupted results, or did ECC contain it?
+`mgx_preflight.sh` section 2b now fails a blocking **arrival gate** on any
+nonzero aggregate uncorrectable ECC count, any row-remap failure, any pending
+repair, or any bank at `None` remap availability. Run it on arrival for every
+borrowed machine, before any load:
 
 ```sh
-D=$(ls -1dt ~/pcieburn/runs/*/ | head -1); echo "$D"
-# events.csv fields: 11 = faulty, 12 = nans
-awk -F, 'NR==1 || $11+0>0 || $12+0>0' "$D/events.csv" | head
-grep -iE 'faulty|nan' "$D/pcieburn.log" | tail -20
+sudo ./mgx_preflight.sh
 ```
 
-- **`faulty` / `nans` still zero** → ECC did its job: it detected and reported
-  rather than letting bad data through. Bad news about the card, no change to the
-  investigation's standing claim.
-- **`faulty` or `nans` nonzero** → this is the **first data corruption observed
-  anywhere in this investigation**, across 38 fleet runs plus this one. Flag it
-  distinctly and loudly; it is a materially more serious class of finding than
-  anything in the corpus, and it does not belong in the same bucket as the link
-  fault.
+Aggregate ECC counters are an acceptance check on the part's whole history.
+Volatile counters are what you read after a run. Do not substitute one for the
+other.
 
-### What the kernel and driver saw
+## 0d. Per-run readout added
+
+ECC is a run variable on this platform and is absent from the fleet, so capture
+it per run alongside the existing telemetry:
 
 ```sh
-sudo dmesg --ctime | grep -E 'Xid|NVRM|ECC' | tail -40
-nvidia-smi -q -d ECC          | sed -n '1,80p'
-nvidia-smi -q -d ROW_REMAPPER
-nvidia-smi --help-query-gpu | grep -iE 'ecc|remap|retired'   # enumerate first
+nvidia-smi -q -d ECC          > "$D/ecc_before.txt"     # $D = the run dir
+nvidia-smi -q -d ROW_REMAPPER > "$D/rowremap_before.txt"
+# ... run the arm ...
+nvidia-smi -q -d ECC          > "$D/ecc_after.txt"
+nvidia-smi -q -d ROW_REMAPPER > "$D/rowremap_after.txt"
 ```
 
-Xid codes to look up rather than assume — check each against NVIDIA's Xid table,
-because the meaning differs by architecture: **48** (double-bit ECC), **63 / 64**
-(row-remap recording, and recording *failure*), **92** (high single-bit rate),
-**94 / 95** (contained / uncontained ECC error). The contained-versus-uncontained
-distinction is the one that matters most: *contained* means the blast radius was
-one process, *uncontained* means the GPU's state is untrustworthy until reset.
-
-Then check whether a remap is pending. A pending row remap needs a GPU reset to
-apply, and until it applies the same address will keep failing:
-
-```sh
-nvidia-smi -q -d ROW_REMAPPER | grep -iE 'pending|failure|remapped'
-sudo nvidia-smi -r -i <N>          # per-GPU reset; needs no compute clients
-```
-
-### Localise it before deciding
-
-```sh
-sudo dcgmi diag -r 2 2>&1 | tee dcgmi_r2_ecc.log     # includes the memory tests
-sudo dcgmi diag -r 3 -p "diagnostic.is_allowed=true" 2>&1 | tee dcgmi_r3_ecc.log
-```
-
-### Why iteration 0 is informative rather than alarming on its own
-
-`pcieburn` defaults to `--mem-frac 0.9`, so it allocates 90% of remaining VRAM
-for C matrices and **iteration 0 is the first time nearly the whole framebuffer
-gets touched**. On a 96 GB card that is a large first-touch sweep. An
-uncorrectable error there reads much more like a pre-existing bad cell that only
-a full-VRAM pass reaches than like load-induced degradation — the load had not
-had time to do anything yet. That also means the harness is incidentally a
-first-touch VRAM exerciser, which is worth knowing but is not a substitute for a
-real pattern-based memory test.
-
-### Decision
-
-| finding | action |
-|---|---|
-| reproduces on one GPU after reset and remap | that card is an RMA. Do not use this box for board comparison until it is replaced — a defective part invalidates the one property that made it valuable. |
-| clears after reset + row remap, does not return over ~3 × 3600 s idle-plus-load | usable, but record the remap in every subsequent run's sidecar; a remapped row is a permanent change to the part under test. |
-| reproduces on multiple GPUs | suspect the platform or the driver-595/kernel-6.8 pairing, not the cards. Check whether ECC mode is even fully supported in that combination before blaming hardware. |
-| `faulty`/`nans` nonzero | stop, preserve the bundle, and treat it as its own finding. Do not continue the arm plan on this box. |
-
-### A workaround that is not free
-
-Excluding the affected GPU with `--gpus 0,1,2,3,4,5,6` keeps the box usable, but
-it is **a new arm, not the same arm**: seven ranks change the collective shape,
-the coherent power step, and the per-switch load distribution. Record it as its
-own arm label and never compare it against an 8-GPU run.
-
-Likewise, disabling ECC to work around this changes memory bandwidth, which
-moves duty cycle, which moves power. Same rule: new arm, not the same arm at a
-different setting. Record `Ecc Mode: Current` in the sidecar either way.
-
-### One angle worth watching, not asserting
-
-Card-local power delivery is the one plausible common cause for memory errors and
-PHY errors on the same board — it is mechanism 2 in the ledger's ranking
-(GPU-local PHY supply disturbance from the card's own load transients). If ECC
-error rate on this box turns out to scale with the power cap, that is worth
-following. At iteration 0 on a first run, though, a defective memory device is
-far more likely, and a single event cannot distinguish them. Do not build on it.
+Also record `Ecc Mode: Current` in the sidecar. ECC costs memory bandwidth,
+which moves duty cycle, which moves power — so if it is ever toggled, that is a
+new arm, not the same arm at a different setting.
 
 ---
 
