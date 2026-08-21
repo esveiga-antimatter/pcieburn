@@ -21,8 +21,12 @@ def nvml_ts(ts):
 rows = []
 for d in RUNS:
     name = os.path.basename(d)
-    m = re.match(r"(\d{8}T\d{6})Z-933b21-[0-9a-f]+-cpt(\w+?)-(.+)$", name)
+    # Match ANY git/binary tag pair, not just 933b21. Hard-coding one commit
+    # silently dropped the nine newest runs and the table still looked plausible;
+    # unparsed directories are now reported instead of skipped in silence.
+    m = re.match(r"(\d{8}T\d{6})Z-[0-9a-f]{6}-[0-9a-f]{6}-cpt(\w+?)-(.+)$", name)
     if not m:
+        print(f"SKIPPED (name does not parse): {name}", file=sys.stderr)
         continue
     r = dict(ts=m.group(1), node=m.group(2), arm=m.group(3), dir=d)
 
@@ -62,7 +66,19 @@ for d in RUNS:
                 r["gemm_s"] = (prog[-1][1] - prog[0][1]) / span
                 r["coll_s"] = (prog[-1][2] - prog[0][2]) / span
 
-    # ---- nvml matched window t=60..93s, width==16 rows only ----
+    # ---- nvml matched window, width==16 rows only ----
+    # The window must END BEFORE THE FAULT. A fixed 60-93 s window blends
+    # teardown idle into every run that died before 93 s, which read 494 W as
+    # 184 W and made the power-matched staircase look like a power effect.
+    # Default 30-93 s; for a short-TTF run, slide back to end 5 s before loss.
+    WIN_LO, WIN_HI = 30.0, 93.0
+    lo, hi = WIN_LO, WIN_HI
+    if r["ttf"] is not None:
+        hi = min(WIN_HI, r["ttf"] - 8.0)
+        if hi - lo < 20.0:
+            lo = max(5.0, r["ttf"] - 40.0)
+            hi = max(lo + 10.0, r["ttf"] - 5.0)
+    r["win"] = (round(lo, 1), round(hi, 1))
     nv = os.path.join(d, "nvml_trace.csv")
     r["pw"] = r["temp"] = r["clk"] = r["clip"] = None
     r["gpu_pw"] = {}
@@ -79,7 +95,7 @@ for d in RUNS:
                 continue
             if t0 is None: t0 = t
             e = (t - t0).total_seconds()
-            if e < 60 or e > 93: continue
+            if e < lo or e > hi: continue
             if "16" not in w: continue
             acc.setdefault(gpu, []).append((pw, tp, clk))
             tot += 1
@@ -92,16 +108,25 @@ for d in RUNS:
             r["clip"] = 100.0 * clip / tot if tot else None
             r["gpu_pw"] = {g: sum(v[0] for v in vs)/len(vs) for g, vs in acc.items()}
 
-    # ---- AER nonzero rows ----
+    # ---- AER nonzero rows, DEDUPED BY (role, bdf) ----
+    # On the switchboard nodes all eight GPUs sit behind the single root port
+    # 1a:01.1, and aer_delta.txt lists that port once per GPU. Summing the rows
+    # as-is counted one NonFatalErr eight times.
     r["aer"] = []
     ad = os.path.join(d, "aer_delta.txt")
     if os.path.exists(ad):
+        seen = {}
         for line in open(ad, errors="ignore"):
             f = line.split()
             if len(f) >= 11 and f[0] in ("dev", "rootport", "switch"):
-                counts = list(map(int, f[3:11]))
+                try:
+                    counts = list(map(int, f[3:11]))
+                except ValueError:
+                    continue
                 if sum(counts):
-                    r["aer"].append((f[0], f[1], f[2], counts))
+                    seen[(f[0], f[2])] = (f[1], counts)
+        r["aer"] = [(role, gpu, bdf, counts)
+                    for (role, bdf), (gpu, counts) in seen.items()]
     r["aer_total"] = sum(sum(c) for *_, c in r["aer"])
 
     # ---- link states ----
@@ -131,16 +156,29 @@ for d in RUNS:
         if dm: r["fault_port"] = dm.group(1)
     r["fault"] = 1 if (r["ttf"] is not None and "LOST" in r["verdict"].upper()
                        or "LOST" in r["verdict"].upper()) else 0
+    # An absent verdict is NOT a clean verdict. One rgca18 bundle has no
+    # end_utc/exit_code/verdict, no dmesg_after and six NUL-truncated files
+    # because the host died mid-run; a blank field read as "clean" hid it.
+    r["incomplete"] = (not r["verdict"]
+                       or not os.path.exists(os.path.join(d, "dmesg_after.txt"))
+                       or not os.path.exists(os.path.join(d, "aer_delta.txt")))
     rows.append(r)
 
 # =========================== MASTER TABLE ===========================
+# Coverage first, so a silently truncated corpus can never masquerade as the
+# whole thing again. Every number below is read out of `rows`.
+print(f"COVERAGE: {len(rows)} runs parsed out of {len(RUNS)} directories under runs/2026*")
+if len(rows) != len(RUNS):
+    print("          *** MISMATCH — see SKIPPED lines on stderr before trusting anything below ***")
 print("=" * 118)
-print("MASTER TABLE — one row per run (power/temp/clip = t=60-93 s matched window, x16 rows only)")
+print("MASTER TABLE — one row per run (power/temp/clip from a PRE-FAULT window, x16 rows only)")
 print("=" * 118)
 hdr = f"{'node':<7}{'arm':<34}{'up(s)':>7}{'cap':>5}{'W':>6}{'T':>5}{'clip%':>6}{'coll/s':>7}{'TTF':>7}{'AER':>8}  outcome"
 print(hdr)
 for r in rows:
     out = "FAULT " + (r["fatal_sig"] or "?") if r["fault"] else r["verdict"]
+    if r["incomplete"]:
+        out = "*** INCOMPLETE BUNDLE — NOT a clean run: " + (r["verdict"] or "no verdict recorded")
     if r["degraded"]: out += " [DEGRADED %s]" % ",".join(g for g, *_ in r["degraded"])
     print(f"{r['node']:<7}{r['arm'][:33]:<34}{r['uptime']:>7}"
           f"{int(r['cap'] or 0):>5}"

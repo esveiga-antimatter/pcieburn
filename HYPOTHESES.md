@@ -25,13 +25,24 @@ fixes to it — but they yield no reliable analysis.
 Prior indications from that period are recorded only so the same ground is not
 re-covered blindly, never as evidence.
 
-**Post-freeze measurement is under way.** Seven arms x three nodes on `933b21f`
-are recorded in [Post-freeze results](#post-freeze-results-933b21f), with six
-faults. They refute hypothesis 1 outright, confirm hypothesis 4 (soak) as causal
-on a single controlled comparison, and establish that no single-factor model fits.
-**Read the corrections subsection first** — three confident claims from an earlier
-revision of this file were wrong, one of them because the harness reported a fatal
-run as `clean`.
+**Post-freeze measurement is under way.** Thirteen batches across three nodes are
+recorded in [Post-freeze results](#post-freeze-results-933b21f), 38 runs and
+**ten containments**. They refute hypothesis 1 outright, refute hypothesis 12,
+demote hypothesis 4 from confirmed-causal, and establish that no single-factor
+model fits. **Read the corrections subsection first** — three confident claims
+from an earlier revision of this file were wrong, one of them because the harness
+reported a fatal run as `clean`.
+
+**Then read [Full-corpus re-read](#full-corpus-re-read-all-38-runs-from-raw-artifacts).**
+A pass over every bundle from the raw artifacts retired four further standing
+claims, resolved h13's mask prerequisite and h14's ambient confound from data
+already on disk, found a **second false negative** (a run whose host died
+mid-run and whose blank `verdict` field was read as clean), reclassified the
+rgca18 "setup error" run as post-fault state, and surfaced a covariate this file
+was not tracking at all: **cor04's kernel changed mid-campaign, and it separates
+the long- and short-TTF faults perfectly.** Three defects in `corr_matrix.py` are
+also documented and fixed there; figures quoted as "27 runs" or "26 runs" earlier
+in this file are that script's silently truncated subset, not the corpus.
 
 ### Binary identity is carried in the run tag
 
@@ -81,9 +92,24 @@ source review. None depends on which `pcieburn` binary ran, so all of it stands.
   downstream ports. Containment there is necessarily fabric-wide: one GPU's fatal
   error takes down every GPU behind that switch. Multiple GPUs dropping together
   on a switch node is expected scope, *not* an escalation.
-- Every DPC event observed reads `ERR_FATAL received from <device>`. A device that
-  had browned out or vanished cannot transmit a fatal error message upstream.
-  **A momentary power dropout is not the mechanism.**
+- **Corrected (38-run re-read).** DPC events split into two register-level
+  classes, and the earlier blanket claim — "every DPC event reads `ERR_FATAL
+  received from <device>`, therefore a momentary power dropout is not the
+  mechanism" — holds for only 7 of 10. The DPC Status register's Trigger Reason
+  field, bits [2:1], separates them and the kernel prints its own decode:
+  - `status:0x1f05` → reason `10`, *`ERR_FATAL` message received*, source device
+    named. Six in-window events, on `00:01.1` and `1a:01.1`. For these the
+    dropout argument stands: the endpoint transmitted its own escalation.
+  - `status:0x1f01` → reason `00`, *unmasked uncorrectable error detected at the
+    port*, decoded `severity=Uncorrectable (Fatal), type=Transaction Layer,
+    (Receiver ID)`, first error `[5] SDES`, **no source device**. Three events,
+    all cor04 `a0:01.1`/GPU5. The GPU transmitted nothing; the root port latched
+    Surprise Down on its own detection and then logged `broken device, retraining
+    non-functional downstream link at 2.5GT/s`.
+
+  So the dropout argument must be scoped to the `ERR_FATAL` class. It says
+  nothing about cor04 GPU5, where the observable is exactly "the device stopped
+  transmitting."
 - Error direction is consistent: corruption is detected at the *receiving* port
   with the GPU as transmitter. That implicates the GPU's TX path and the physical
   channel, not the root port's transmitter.
@@ -156,20 +182,40 @@ mistake, not by bad luck.
    the line was fitted through also spanned three different boots, so it was never
    a within-boot soak trend.
 
-### The six faults
+### Every containment in the corpus (10, over 38 runs)
 
-| # | node | arm | t | port | GPU | signature | radius |
-|---|---|---|---|---|---|---|---|
-| 1 | cor04 | uncapped 2048 | 282 s | `a0:01.1` | GPU5 `a1:00.0` | `SDES`, no correctables | 1 GPU |
-| 2 | cor04 | lgc2100 | 214 s | `00:01.1` | GPU0 `01:00.0` | `ERR_FATAL`, zero AER counters | 1 GPU |
-| 3 | cor04 | pl575 8192 | 107 s | `a0:01.1` | GPU5 `a1:00.0` | `SDES`, correctables on GPU0's port | 1 GPU |
-| 4 | rgca18 | pl575 8192 | 598 s | `1a:01.1` | GPU4 `2d:00.0` | 1836 RxErr → Rollover → `ERR_FATAL` | **all 8** |
-| 5 | rgca18 | pl450 8192 | ~609 s | `1a:01.1` | GPU4 `2d:00.0` | 694,377 RxErr → `ERR_FATAL` | **all 8** |
-| 6 | cor04 | pl450-warm 8192 | 224 s | `00:01.1` | GPU0 `01:00.0` | `ERR_FATAL`, 3954 BadTLP | 1 GPU |
+Harvested by deduping every `DPC: containment event` line across every `dmesg`
+snapshot in every bundle by (node, wall-clock second, port). Ten events, nine
+inside a run's own capture window plus fault 5 at +1.0 s past its window. No
+others hide in any gap. Bounded, as before, by the three run tails a following
+reboot put beyond `dmesg` reach.
 
-cor04 4, rgca18 2, rgca17 0. cor04 alternates between its two implicated ports
-with no discernible pattern (GPU5, GPU0, GPU5, GPU0). `faulty=0 nan=0` in every
-run — data corruption has still never been observed.
+| # | node | arm | t | port | GPU | DPC reason | signature | radius |
+|---|---|---|---|---|---|---|---|---|
+| 1 | cor04 | uncapped 2048 | 282.2 s | `a0:01.1` | GPU5 `a1:00.0` | `0x1f01` / `00` | `SDES`, no correctables anywhere on that port, ever | 1 GPU |
+| 2 | cor04 | lgc2100 | 214.5 s | `00:01.1` | GPU0 `01:00.0` | `0x1f05` / `10` | `ERR_FATAL`; 1 correctable log line, same second; **AER delta reads all zero** | 1 GPU |
+| 3 | cor04 | pl575 8192 | 106.9 s | `a0:01.1` | GPU5 `a1:00.0` | `0x1f01` / `00` | `SDES`, correctables on GPU0's port 27 s earlier | 1 GPU |
+| 4 | rgca18 | pl575 8192 | 598.1 s | `1a:01.1` | GPU4 `2d:00.0` | `0x1f05` / `10` | 1836 RxErr → `ERR_FATAL`; **1.9 s before load end** | **all 8** |
+| 5 | rgca18 | pl450 8192 | 608.8 s | `1a:01.1` | GPU4 `2d:00.0` | `0x1f05` / `10` | 694,377 RxErr → `ERR_FATAL`; **8.8 s after load end**, outside the window | **all 8** |
+| 6 | cor04 | pl450-warm 8192 | 224.2 s | `00:01.1` | GPU0 `01:00.0` | `0x1f05` / `10` | `ERR_FATAL`, 3954 BadTLP | 1 GPU |
+| 7 | cor04 | coll4M 8192 | 95.1 s | `a0:01.1` | GPU5 `a1:00.0` | `0x1f01` / `00` | `SDES`; 922 BadTLP on GPU0's port, last 19 s earlier | 1 GPU |
+| 8 | cor04 | uncapped 2048 | 65.6 s | `00:01.1` | GPU0 `01:00.0` | `0x1f05` / `10` | `ERR_FATAL`, 8 correctable lines spanning 4 s | 1 GPU |
+| 9 | cor04 | uncapped 2048 | 60.7 s | `00:01.1` | GPU0 `01:00.0` | `0x1f05` / `10` | `ERR_FATAL`, 15 correctable lines spanning 4 s | 1 GPU |
+| 10 | rgca17 | uncapped 2048 | 201.4 s | `1a:01.1` | gpu6 `36:00.0` | `0x1f05` / `10` | `ERR_FATAL`; 1 RxErr / 1 BadTLP on `34:10.0` | **all 8** |
+
+cor04 7, rgca18 2, rgca17 1. `faulty=0 nan=0` in **38 of 38 runs** — data
+corruption has still never been observed.
+
+**Victim alternation on cor04 is borderline and has broken.** GPU5, GPU0, GPU5,
+GPU0, GPU5, GPU0, GPU0 — 5 of 6 consecutive pairs alternate, p = 0.109 against a
+fair coin. Do not build on it.
+
+**Xid 154's recovery action is not a reliable reset-versus-reboot input.** cor04
+requested `0x2 (Node Reboot Required)` in all seven of its events and rgca17 in
+its one, but rgca18 requested `0x2` for fault 4 and **`0x1 (GPU Reset Required)`
+for fault 5** — and after fault 5 all eight GPUs stayed invisible to the OS for
+9 h 15 m until a reboot (see the reclassified run below). Automation keyed on
+this field would have tried a GPU reset on an unrecoverable node.
 
 ### Soak is causal: the cleanest single-variable result so far
 
@@ -382,9 +428,22 @@ was GPU0/ERR_FATAL where the original was GPU5/SDES, so the re-run sampled the
 ≤ 65.6 s has ~21% probability — direction matches wear, magnitude is one
 exponential draw, not proof. The refit below is the sober version.
 
-The idle hour produced nothing on any node: no fault, zero AER, links full width.
-Idle soak at pl450 through 1 h is unremarkable — which, combined with the re-run,
-moves the "uptime" story toward wear/campaign-time and away from within-boot time.
+The idle hour produced no fault on any node and no width loss, so idle soak at
+pl450 through 1 h is unremarkable — which, combined with the re-run, moves the
+"uptime" story toward wear/campaign-time and away from within-boot time.
+
+**Correction: "zero AER" in this batch was wrong, and only rgca18 was zero.**
+Read straight from the three `aer_delta.txt` files:
+
+| node | port | RxErr | BadTLP | BadDLLP | GPU Rollover |
+|---|---|---|---|---|---|
+| cor04 | `00:01.1` (GPU0) | 0 | **1,214** | 0 | 10 |
+| rgca17 | `34:10.0` (gpu6) | **108** | **200** | 1 | 18 |
+| rgca18 | — | 0 | 0 | 0 | 0 |
+
+The idle-soak conclusion survives; the phrase "zero AER" must not be quoted from
+this batch. cor04's 1,214 is also a data point in the correctable-versus-fatal
+anti-correlation below.
 
 **Wrapper v2 false positive found and fixed in v3.** All four RGCA runs in this
 batch were verdict-gated `CLEAN BUT LINK DEGRADED` with a *uniform* ~35 s
@@ -585,8 +644,390 @@ coherent-peak coincidence, and is not yet supported as a general mechanism.
 
 ---
 
+## Full-corpus re-read (all 38 runs, from raw artifacts)
 
-## Third platform: intelmgx-CG480 (8x RTX PRO 6000 Blackwell Server, loaner)
+Every bundle in `runs/` parsed directly from `manifest.txt`, `events.csv`,
+`nvml_trace.csv`, `aer_delta.txt`, `aer_uncorrectable.csv`,
+`pcie_link_states*.txt`, `pcie_link_rootports.csv`, `psu_summary.txt` and every
+`dmesg` snapshot — not through the existing summary scripts. Corpus totals:
+38 bundles, 3 nodes, 13 batches, 10 containments, 18,197 s of load exposure.
+
+### Three tooling defects that changed the numbers
+
+Found while reproducing the earlier correlation pass; all three are now fixed in
+`corr_matrix.py`.
+
+1. **Its directory regex hard-coded `933b21`**, so it silently skipped the nine
+   newest runs (the `538076` and `911fc2` batches). The "27 runs" and "26 runs"
+   figures quoted above are that subset, not the corpus.
+2. **Its fixed t=60–93 s window blends teardown idle into any run that faulted
+   before 93 s** — now three of them. This is why the two `up700s` cor04 runs
+   read 184 W and 120 W on a naive re-run. Under a window that always ends ≥5 s
+   before the fault they read **494 W and 495 W**, which is what the
+   `baseline-uncapped` comparison actually rests on.
+3. **It summed AER rows without deduping by `(role, bdf)`.** On RGCA nodes the
+   shared root port `1a:01.1` is listed once per GPU, so a single `NonFatalErr`
+   was counted eight times.
+
+### Corpus integrity: two runs are not what the corpus records
+
+**`20260819T203844Z-933b21-ad0a69-cptrgca18-…-gpc1` — the host died mid-run.**
+Six live-written files end in NUL padding to an exact page boundary
+(`events.csv`, `nvml_trace.csv`, `psu_current.csv`, `pcie_dmon.txt`,
+`pcieburn.log`, `aer_counters.csv`) — a filesystem that recorded inode sizes and
+never flushed the data. **Every post-run artifact is absent**: no
+`aer_delta.txt`, `dmesg_after.txt`, `dmesg_delta.txt`, `faults.txt`,
+`pcie_link_states*.txt`, `psu_summary.txt`. The manifest has no `end_utc`, no
+`exit_code` and no `verdict`. Last flushed telemetry is t=+589.3 s of load; its
+byte-identical twin on the same node (20:14, same arm, same binary) ran 643.5 s,
+so it died between t≈589 s and load end. Both sibling runs in that batch (cor04,
+rgca17) completed normally, so this was not a rack-level power event.
+
+This is the **second false negative in the corpus and a worse one than fault 5**,
+which at least left a `dmesg` tail on the next run's snapshot. rgca18's next
+bundle boots at 22:41:13, so the 20:48 kernel tail is unrecoverable from the
+artifact set. `journalctl --list-boots` then `journalctl -b -N` on rgca18 is the
+only remaining route and is worth spending: a third rgca18 event near 600 s of
+load would move the timing pattern below from three points to a signature.
+
+**The rgca18 "setup/usage error" run is fault 5's 9-hour aftermath, not an
+excluded null.** Its log says `no CUDA devices found (probe returned -1)`, but
+the manifest's own `nvidia-smi -L` snapshot carries **eight** lines of `Unable to
+determine the device handle for gpu <bdf>: Unknown Error`, and its
+`dmesg_before` carries the 01:42:16 containment, `Xid 79` on all eight GPUs and
+`AER: device recovery failed`. It is the **same boot** as the run that took
+fault 5. So it is positive evidence that a switch-node containment removes all
+eight GPUs from the OS for the remainder of the boot — here 9 h 15 m — and it is
+where the `0x1 (GPU Reset Required)` trap above was found. The Bayesian fit
+should stop excluding it as a setup error and start counting it as post-fault
+state; rgca18's wear should also be 2, not 1, since fault 5 is currently
+uncounted.
+
+### Provenance holds
+
+One driver (`580.178.04`) on all 38 runs, one binary hash per node throughout
+(`692bd6` / `fd4431` / `ad0a69`), and all 13 batches launched on a single commit.
+One covariate is **not** clean and is not currently a recorded run variable — see
+the kernel confound below.
+
+### h13 resolved on fleet hardware: the zero is not a mask artifact
+
+The ledger held h13 pending a `CEMsk` read on a fleet GPU. The kernel already
+printed the register, every time a GPU endpoint logged. Correctable Error mask
+bit 0 is RxErr, bit 6 BadTLP, bit 7 BadDLLP, bit 12 Replay Timer Timeout:
+
+| device | slot | status | mask | masked |
+|---|---|---|---|---|
+| `nvidia 0000:01:00.0` | cor04 GPU0 | `0x00001100` | `0x00001000` | ReplayTimerTimeout only |
+| `nvidia 0000:2d:00.0` | rgca18 gpu4 | `0x00001100` | `0x00001000` | ReplayTimerTimeout only |
+| `nvidia 0000:36:00.0` | rgca17 gpu6 | `0x00001100` | `0x00001000` | ReplayTimerTimeout only |
+| `pcieport 0000:2b:10.0` | rgca18 leaf | `0x000000c1` | `0x00001000` | ReplayTimerTimeout only |
+| `pcieport 0000:34:10.0` | rgca17 leaf | `0x000010c1` | `0x00001000` | ReplayTimerTimeout only |
+| `pcieport 0000:00:01.1` | cor04 GPU0 root | `0x00000040` | `0x00001000` | ReplayTimerTimeout only |
+
+This is a **stronger** argument than the counter totals it replaces. The status
+register latches regardless of the mask, so the GPU rows are not merely
+un-incremented counters: the GPU's own hardware recorded bits 8 and 12 set and
+bits 0, 6 and 7 **clear** at the moment it reported, while its upstream receiver
+recorded exactly the opposite. RxErr and BadTLP are unmasked on all three
+implicated GPU endpoints, on fleet hardware, driver 580, OS-first. The pending
+`lspci` check is no longer a prerequisite for h13.
+
+Corpus-wide, deduped by port: **697,979 RxErr / 94,989 BadTLP / 6,275 BadDLLP**
+on upstream receivers against **zero of all three** on GPU endpoints, which
+logged 988 Rollover — their own replay timer, i.e. them retransmitting. Only
+four ports out of forty have ever logged a correctable error, and cor04
+`a0:01.1` remains at zero across all 38 runs despite three fatals.
+
+One reading caution: the `a0:01.1` line showing `mask=0x00000000` belongs to an
+**Uncorrectable** error block, so it is the uncorrectable mask register, not a
+correctable-mask anomaly. Nothing masked there either, which is why the
+classifier below works.
+
+### `aer_uncorrectable.csv` is a working classifier, not a blind spot
+
+The analysis-discipline entry saying this file cannot detect the thing is wrong.
+It separates the two fatal classes perfectly, with no false positives across the
+29 non-fatal runs:
+
+| class | runs | data rows each | content |
+|---|---|---|---|
+| reason `00` — SDES at the port | 3 | **70** | `a0:01.1 rootport fatal SDES` + `TOTAL_ERR_FATAL`, latched ~1.5 s after DPC |
+| reason `10` — `ERR_FATAL` received | 6 | 0 | header only |
+| clean | 29 | 0 | header only |
+
+Fisher exact on 3/3 versus 0/6 gives p = 0.012. The emptiness is diagnostic, not
+a sampling failure: in the `ERR_FATAL` class the root port never records an
+uncorrectable error *of its own*, so there is nothing to poll. A non-empty file
+is a positive identification of the silent GPU5 mode — the only mode that leaves
+no other trace.
+
+### Precursors exist for one class only, and the lead time is seconds
+
+Port-matched: for each containment, were there correctable log lines on *the same
+port* beforehand?
+
+| # | node | port | same-port lines | first | last | largest interior gap |
+|---|---|---|---|---|---|---|
+| 1 | cor04 | `a0:01.1` | **0** | — | — | — |
+| 3 | cor04 | `a0:01.1` | **0** | — | — | — |
+| 7 | cor04 | `a0:01.1` | **0** | — | — | — |
+| 2 | cor04 | `00:01.1` | 1 | 0 s | 0 s | — |
+| 8 | cor04 | `00:01.1` | 8 | 4 s | 0 s | 4 s |
+| 9 | cor04 | `00:01.1` | 15 | 4 s | 0 s | 3 s |
+| 10 | rgca17 | `1a:01.1` | 14 | 0 s | 0 s | — |
+| 6 | cor04 | `00:01.1` | 169 | 103 s | 0 s | 31 s |
+| 4 | rgca18 | `1a:01.1` | 199 | 201 s | 0 s | **102 s** |
+
+Three consequences. **The silent class is unmonitorable** — `a0:01.1` has logged
+zero correctables in all 38 runs and produced three fatals from perfect silence,
+so no AER-rate alarm can ever see it; its only positive signal is the
+`aer_uncorrectable.csv` latch, after the fact. **The warning class warns late** —
+all six `ERR_FATAL` events have same-port correctables ending in the *same
+second* as the containment, and in three of six the entire precursor sequence is
+4 s long. Detection is feasible; prevention is not. **The quiet-gap lesson
+sharpens** — fault 4 went 102 s with nothing on the root port before resuming and
+dying in the same second, so the earlier "80 s" figure should read 102 s on
+`1a:01.1`.
+
+### Correctable volume and fatal hazard are anti-correlated on the same slot
+
+Holding node, cap, matrix dimension and arm constant on cor04's warning slot:
+
+| run | when | uptime | prior fatals | mean W | BadTLP on `00:01.1` | outcome |
+|---|---|---|---|---|---|---|
+| pl450-8192 cold | 08-19 01:31 | 216 s | 3 | 438 | 32,275 | clean |
+| pl450-warm | 08-19 10:43 | 33,347 s | 3 | 440 | 3,954 | **fault 224 s** |
+| pl450-8192 up1h | 08-19 23:49 | 4,082 s | 5 | 437 | 1,214 | clean |
+
+The first two are h4's controlled pair — same boot, same cap, same arm, power
+matched to 2 W. The new observation is that the correctable rate fell **8×**
+across that pair *and* the fatal appeared; by the third run it is 27× below the
+first. Over the same interval cor04's time-to-fault on the matched uncapped arm
+fell 4.6×. This upgrades "correctables and escalation are separate processes"
+from an absence of correlation to a **measured anti-correlation**, and is a
+second independent reason not to build an alarm on AER rate.
+
+### rgca18's three terminal events all landed within 20 s of 600 s of load
+
+Read together with the truncated run above, rgca18 has had exactly three
+terminal events:
+
+| event | t of load | nominal load end | note |
+|---|---|---|---|
+| host crash, 08-19 20:38 | ≥ 589.3 s | ~641 s (gpc1 arm) | bound is the last flushed page, so the true time is later |
+| fault 4 | 598.1 s | 600 s | 1.9 s before load end |
+| fault 5 | 608.8 s | 600 s | 8.8 s after load end |
+
+Under a uniform hazard across a 600 s run, one event landing in a 20 s window at
+the end has probability 0.033; all three has probability **3.7 × 10⁻⁵**. For
+contrast, cor04's seven faults sit at 10, 11, 16, 18, 36, 37 and 47% of their
+load phases, and rgca17's single fault at 34%.
+
+Recognising 598.1 s as the load boundary unifies faults 4 and 5 under one timing
+pattern rather than treating one as a coherent-current-peak coincidence and the
+other as a release event. But the more important consequence is a design defect:
+**every rgca18 run in the corpus is censored at almost exactly the point where
+its hazard concentrates**, so its eight `clean` verdicts carry far less
+information than their count suggests.
+
+*Discriminating test.* "Release edge" and "~600 s of cumulative exposure" are
+indistinguishable while every run is 600 s. One **1200 s** run on rgca18
+separates them: a fault near 600 s means cumulative exposure with a knee at ten
+minutes; near 1200 s means the release transition; no fault falsifies both. This
+is cheaper and cleaner than h9's N × 100 s design, which moves teardown count and
+per-run exposure together. It also tests a competing explanation worth keeping in
+view — that the wrapper's own post-load config-space sweep across ~17 devices is
+the provocation.
+
+### The RGCA fabric is a three-tier cascade; both victims sit on its deepest branch
+
+`pcie_link_rootports.csv` is byte-identical on rgca17 and rgca18 and shows far
+more structure than "all eight GPUs behind one root port": three switch tiers,
+with three GPUs 3 hops from the root port and four at 5 hops behind a third-tier
+switch.
+
+| GPU endpoint | hops | path from root port to leaf downstream port |
+|---|---|---|
+| `1f:00.0` | 3 | `1a:01.1 → 1c:00.0 → 1e:00.0` |
+| `20:00.0` | 3 | `1a:01.1 → 1c:00.0 → 1e:10.0` |
+| `23:00.0` | 3 | `1a:01.1 → 1c:04.0 → 22:00.0` |
+| `3b:00.0` | 3 | `1a:01.1 → 1c:0c.0 → 27:10.0` |
+| `2c:00.0` | 5 | `1a:01.1 → 1c:0c.0 → 27:00.0 → 29:00.0 → 2b:00.0` |
+| **`2d:00.0`** | 5 | `1a:01.1 → 1c:0c.0 → 27:00.0 → 29:00.0 → 2b:10.0` — **rgca18 victim** |
+| `30:00.0` | 5 | `1a:01.1 → 1c:0c.0 → 27:00.0 → 29:04.0 → 2f:00.0` |
+| **`36:00.0`** | 5 | `1a:01.1 → 1c:0c.0 → 27:00.0 → 29:0c.0 → 34:10.0` — **rgca17 victim** |
+
+Both susceptible slots are 5 hops deep, behind third-tier switch `29`, on a leaf
+downstream port ending `:10.0` — a set with exactly two members of eight, so the
+null probability of both landing there is (2/8)² = 0.06. **The feature was
+identified after seeing which slots failed; treat that number as a prompt, not a
+test.**
+
+The mechanism it does *not* support matters as much. No intermediate hop (`1c`,
+`27`, `29`) ever logged an error in 38 runs, and every count sits on the final
+GPU↔leaf link, so jitter is not accumulating down the cascade — each hop is an
+independently retimed link. Depth is therefore a proxy for **physical placement
+on the switchboard** (trace length, connector position, airflow), which is the
+kind of physical referent term A has been missing. It also revises the h6 note
+that these are "different physical slots on identical boards": they are
+**homologous branch positions**, which turns the swap test into a matched
+within-branch comparison available on *both* nodes.
+
+### The susceptible slot is never the node's thermal extreme
+
+Mean temperature rank per slot across every run with all eight GPUs in the
+matched window, rank 1 = hottest. Victim *power* rank was already known to be
+non-predictive; temperature and thermal swing had not been checked, and they are
+the natural candidates for a fretting or PHY-heat story.
+
+| node | hottest three slots (mean T-rank) | susceptible slot | its T-rank | its ΔT-rank | coldest |
+|---|---|---|---|---|---|
+| cor04 | gpu5 (1.31), gpu1 (2.38), gpu4 (2.92) | gpu5 · gpu0 | 1.31 · 4.00 | 1 · 7 | gpu7 (7.85) |
+| rgca17 | gpu1 (1.64), gpu3 (1.91), gpu6 (3.36) | gpu6 | 3.36 | 1 | gpu4 (6.73) |
+| rgca18 | gpu1 (1.45), gpu0 (1.55), gpu4 (3.00) | gpu4 | 3.00 | 2 | gpu7 (7.82) |
+
+cor04's gpu5 *is* the hottest slot in 12 of 13 runs — a genuine, stable per-slot
+asymmetry worth recording. But the second- and third-hottest slots on that node
+have never failed; cor04 gpu0 has failed four times from rank 4.00 with the
+second-**lowest** thermal swing on the node; and both RGCA victims sit mid-pack
+behind two hotter slots that have never produced a single error. Victim
+temperature ranks across the nine in-window faults are 1, 5, 1, 3, 4, 5, 4, 3, 1
+— mean 2.9 against a null of 4.5, entirely carried by cor04 gpu5.
+
+**Junction temperature and thermal cycle depth are therefore excluded as the
+slot-selection term.** This does not touch h16's claim about cycle count driving
+degradation over time; it removes the version of h16 that would predict *which*
+slot degrades, and it removes ranked mechanism 4 ("GPU PHY junction heat as a
+term-B ingredient") from the slot-selection role.
+
+### PCIe payload is exonerated harder than the "2.9% of Gen5 x16" figure implies
+
+h5's discriminating test is "128M vs 4G at fixed compute; if TTF is unchanged,
+PCIe traffic is exonerated outright." Computed per run from
+`coll_bytes_pcie_link` in `events.csv`:
+
+| arm | node | GB/s per rank | % Gen5 x16 | mean W | outcome |
+|---|---|---|---|---|---|
+| 8192 gpc1 128M–1G | cor04 | **37.16** | **59.0** | 287 | clean, 0 AER |
+| 8192 gpc1 128M–1G | cor04 | **37.10** | **58.9** | 286 | clean, 0 AER |
+| 8192 gpc1 128M–1G | rgca17/18 | 9.26–9.29 | 14.7 | 148–152 | clean ×4 |
+| 2048 uncapped | cor04 | 4.30–4.60 | 6.8–7.3 | 494–495 | fatal ×3 |
+| 8192 single full burst | cor04 | 0.92–1.01 | 1.5–1.6 | 440–503 | fatal ×2 |
+| 8192 gpc1 coll4M | cor04 | 0.81 | 1.3 | 545 | fatal, 95 s |
+
+cor04 — the node that faults once per 667 s of load — ran **59% of Gen5 x16 for
+606 and 607 s with zero AER counts and no fault, twice**. Across 37 runs
+r(egress, fault) = **−0.18**; faulting runs span 0.81–4.60 GB/s per rank, clean
+runs 0.83–37.16.
+
+Honest limit: the high-traffic arms are also the low-power ones, so this shows
+traffic cannot *substitute* for power, not that traffic is irrelevant at fixed
+power. Closing h5 outright needs an arm holding ~495 W **and** ~37 GB/s, which
+the current knobs cannot express — raising collective share lowers duty cycle and
+therefore power. That is a harness design problem, not another run.
+
+### Ambient is measurable retroactively, and is not the mediator of anything
+
+Every bundle contains ~30 s of pre-load NVML at idle; the coldest idle GPU
+reading is a usable proxy for thermal state at load start. Across 36 runs it
+spans 19–29 °C and is mostly a per-node offset, not a diurnal signal.
+
+| statistic | value | reading |
+|---|---|---|
+| r(ambient, fault) | +0.06 | n = 36; no association |
+| r(ambient, ln TTF) over faults | −0.27 | n = 9; weak, wrong magnitude |
+| mean, faulting runs | 21.3 °C | 0.2 °C apart |
+| mean, clean runs | 21.1 °C | |
+| the two 02:50 faults | 22 / 20 °C | time-of-day not implicated |
+| across the power-matched staircase | 20 → 21 → 22 °C | 2 °C total, against a 4.6× TTF change |
+
+That last row removes ambient from the covariates moving together across the
+cor04 staircase, leaving two rather than three. The `ipmitool sdr` inlet read is
+still worth adding for the record but is no longer blocking.
+
+### The staircase is airtight on the load side, and newly confounded by a kernel upgrade
+
+| run | when | mean W | mean clk | clk sd | p98 clk | ambient | uptime | prior fatals | kernel | TTF |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 08-18 22:50 | 495 | 2412 | 141 | 2692 | 20 °C | 697 s | 0 | `7.0.0-28` | 282.2 s |
+| 2 | 08-20 02:01 | 494 | 2412 | 136 | 2692 | 21 °C | 812 s | 5 | `7.0.0-29` | 65.6 s |
+| 3 | 08-20 02:49 | 495 | 2410 | 136 | 2692 | 22 °C | 1,499 s | 6 | `7.0.0-29` | 60.7 s |
+
+Matched to 1 W of mean power, 2 MHz of mean clock, 5 MHz of clock standard
+deviation, 0 MHz at p98 and 2 °C of ambient — and time-to-fault fell 4.6×.
+Within-boot uptime is **eliminated** as the mediator: it rose across the three
+while TTF fell, and pooled across all nine faults r(ln uptime, ln TTF) = **+0.35**,
+the wrong sign for soak. Ambient is eliminated above. Over the fault set
+r(prior fatals, ln TTF) = **−0.86** pooled and **−0.88** within cor04 — the
+strongest association in the corpus — against r(power, ln TTF) = −0.21.
+
+**But cor04's kernel went `7.0.0-28` → `7.0.0-29` between the pl450-warm run and
+the first gpc1 run, while both RGCA nodes stayed on `-28` throughout, and kernel
+version is not currently a recorded run variable.** Every long-TTF cor04 fault
+(282, 214, 107, 224 s; mean 207) is on `-28` and every short one (95, 66, 61 s;
+mean 74) is on `-29` — a *perfect* separator, and a cleaner one than prior-fault
+count, which has the 224 s pl450-warm fault out of order. Mitigating evidence:
+diffing the two boots' PCIe lines gives identical `_OSC` (26), `DPC` (44) and
+`ASPM` (8) line counts and an identical command line apart from the image name,
+so error-handling configuration did not change — but the NVIDIA kernel module was
+rebuilt.
+
+*Cheapest decisive run in the plan.* Boot cor04 on `7.0.0-28` and repeat
+`baseline-uncapped` at ~700 s uptime. TTF back near 200–280 s implicates the
+kernel and dissolves the wear staircase; TTF still near 60 s removes the kernel
+and leaves wear versus campaign-time. One reboot, no code, more decisive than the
+4–6 wear runs currently budgeted.
+
+Statistical honesty on the staircase itself: under a constant hazard with mean
+282 s, two consecutive draws both ≤ 66 s have probability 0.040. Suggestive, not
+settled — and these are descriptive correlations over fault events. The censored
+survival fit remains the authority on hazard, and should be re-run with a kernel
+term, with the two reclassified runs above, and with rgca18's wear corrected.
+
+### Per-node hazard, with exposure properly accounted
+
+| node | runs | load exposure | containments | rate | 
+|---|---|---|---|---|
+| cor04 | 13 | 4,666 s | 7 | 1 per **667 s** |
+| rgca18 | 10 | 6,041 s | 2 | 1 per 3,021 s |
+| rgca17 | 13 | 7,490 s | 1 | 1 per 7,490 s |
+
+cor04 7/13 runs fatal against rgca17 1/13 gives Fisher one-sided **p = 0.015**,
+so h6 is now statistically supported rather than only descriptive; on exposure the
+rate ratio is 11.2×. **No run in the corpus exceeded 642 s of load**, so every
+`clean` verdict in the entire corpus is bounded at roughly one arm-length.
+
+### Confirmed unchanged
+
+- **Correctables accrue only under load.** 696 distinct (node, second, port)
+  correctable events across every `dmesg` snapshot in the corpus; every one falls
+  inside a load window, including across rgca17's 9.3 h idle stretch.
+- **Cap clipping fails as a stress metric.** r(clip%, AER) = +0.18,
+  r(clip%, fault) = −0.04 over 37 runs.
+- **PSU envelope is not predictive.** r(peak instrumented pair, fault) = +0.27,
+  r(max swing, fault) = +0.21. The pl450-warm fatal had the *lowest* current
+  swing of any 8192 run (55.8 A), which also sits against an amplitude-driven
+  reading of h9.
+- **Per-boot training dominates rgca17's error counts (h10).** Its gpu6 logged
+  9,672 counts on the boot where it dwelt 265 s at gen1 and exactly zero on both
+  runs where it trained to gen5 **x8**. Note that only the three `911fc2` runs
+  carry `pcie_link_states_load.txt`, so every earlier link-state reading is
+  whole-trace and includes the uniform pre-load gen1 artifact — the x8 states are
+  real at 6,070 and 6,058 samples; the uniform ~35 s dwells are not.
+- **h3 is weaker than "actively harmful, 2/2 nodes".** The pin worked —
+  `lgc2100` cut cor04's SM clock sd from 141 to 28 MHz and rgca17's from 223 to
+  24 — and cut power from 495 to 395 W. But the cor04 comparison is 282.2 s at
+  0 prior fatals against 214.5 s at 1 prior fatal: a 24% TTF change across
+  exactly one increment of the covariate the staircase shows is worth 4.6× over
+  five. The rgca17 leg is a correctable-count difference on a node whose counts
+  are not comparable across boots. Read as "no benefit observed, confounded with
+  wear"; the `-lgc` near-boost arm is still the right test.
+
+---
+
+
+## Third platform: intelmgx-CG480 (8x RTX PRO 6000 Blackwell Server)
 
 **Never pool this box's numbers with cor04/RGCA data.** It differs on every axis
 at once: same GB202 die but the PRO SKU (more SMs, 600 W default), dual-socket
@@ -748,10 +1189,10 @@ scratched rounds have been dropped where real data now exists.
 |---|---|---|---|
 | 1 | **Kernel dispatch rate.** Small kernels impose high-frequency load modulation; VRM output impedance peaks near its loop bandwidth, and rail ripple costs PCIe eye margin. | **REFUTED.** 54 GEMM/s vs 4,490-6,004 — a ~100x reduction — produced the most destructive arm tested (cor04 107 s, rgca18's first-ever fault). Predicted direction was the opposite. | closed unless a mechanism is proposed that survives this result |
 | 2 | Power level. | **Not protective on its own.** Both susceptible nodes faulted at 450 W: rgca18 at ~609 s (fault 5) and cor04 at 224 s once warm (fault 6). A lower cap also *increases* cap clipping (47% vs 35% of samples) and, on rgca18, coincided with 378x more correctable errors. Mean power is a poor summary of this workload. | hold the cap fixed and vary soak; treat clipping fraction, not mean watts, as the stress metric |
-| 3 | Clock/voltage pinning (transient suppression). | **Actively harmful, 2/2 nodes.** `lgc2100` did worse than the free-clock arm at *higher* power on both cor04 (398 W faulted vs 437 W clean) and rgca17 (326 W, 21 errors vs 362 W, 0). Folded into term C. | `-lgc` **near boost** (~2550) so only variation is removed, not level. A low lock moves level, variation and dispatch rate at once. |
+| 3 | Clock/voltage pinning (transient suppression). | **Downgraded to "no benefit observed, confounded with wear".** The pin worked (cor04 SM-clock sd 141 → 28 MHz, rgca17 223 → 24) and cut power 495 → 395 W, but the cor04 evidence is 282.2 s at 0 prior fatals vs 214.5 s at 1 prior fatal — a 24% TTF change across exactly one increment of the covariate the power-matched staircase shows is worth 4.6× over five. The rgca17 leg (0 errors at 362 W vs 21 at 326 W) is a correctable-count difference on a node whose counts are not comparable across boots. The earlier "actively harmful, 2/2 nodes" reading is withdrawn. | `-lgc` **near boost** (~2550) so only variation is removed, not level. A low lock moves level, variation and dispatch rate at once. |
 | 4 | Uptime / time since cold boot. | **DEMOTED from confirmed-causal.** The controlled pair (clean at 216 s uptime vs fault at 33,347 s, 438/440 W) stands, but the follow-ups moved against a smooth soak effect: clean at 4082 s uptime (pl450-8192, wear=5), fault at 812 s uptime (baseline re-run, 494 W), and the 32-run refit puts the soak MAP at zero. What remains viable is a **threshold** in (4082 s, 33347 s] — never tested by the smooth model — or the pair's effect belongs to wear/ambient (h14). | continue the bisection from above: ~4 h and ~9 h points at pl450-8192 on cor04; read jointly with the h14 staircase |
-| 5 | **Interleaving** — the question the harness was built for. | Weakened further: the 8192 arm moved 0.8% of Gen5 x16 versus 2.5-3.0% in the baseline and faulted *more*. | `--coll-min/--coll-max` 128M vs 4G at fixed compute. 32x bytes moved. If time-to-fault is unchanged, PCIe traffic is exonerated outright. |
-| 6 | Per-machine susceptibility. | **Revised: susceptibility sets rate and victim, not immunity.** All three nodes have now faulted (cor04 x7, rgca18 x2, rgca17 x1). Victim slots are stable per node and every fatal has come from a previously-identified slot: cor04 GPU5 `a0:01.1` (SDES, silent) + GPU0 `00:01.1` (ERR_FATAL, correctable-generating); rgca17 gpu6 `34:10.0`; rgca18 gpu4 `2b:10.0`. rgca17/18 share identical BDF maps, so these are different physical slots on identical boards. | read-only `Lane Error Status` / `LnkSta2` on the four implicated links vs healthy peers; then card/slot swap using the direction split (h13) to interpret |
+| 5 | **Interleaving** — the question the harness was built for. | **Near-closed, and traffic is exonerated far harder than the earlier "2.9% of Gen5 x16" framing.** Computed per run from `coll_bytes_pcie_link`: cor04 — the node that faults once per 667 s of load — ran **59.0% and 58.9% of Gen5 x16 for 606 and 607 s with zero AER counts and no fault**, while faulting reliably at 1.3–7.3%. Across 37 runs r(egress, fault) = **−0.18**; faulting runs span 0.81–4.60 GB/s per rank, clean runs 0.83–37.16. | The 128M-vs-4G arm is now redundant — the gpc1 arms already moved 8–40× more bytes for nothing. What is left is the confound: the high-traffic arms are also the low-power ones, so this shows traffic cannot *substitute* for power, not that it is irrelevant at fixed power. Closing h5 outright needs an arm holding ~495 W **and** ~37 GB/s, which the current knobs cannot express (raising collective share lowers duty cycle and therefore power). That is a harness design decision, not a run. |
+| 6 | Per-machine susceptibility. | **Statistically supported, not just descriptive.** cor04 7/13 runs fatal vs rgca17 1/13 gives Fisher one-sided **p = 0.015**; on load exposure the rates are 1 per 667 s (cor04), 1 per 3,021 s (rgca18) and 1 per 7,490 s (rgca17) — an 11.2× ratio. Susceptibility sets rate and victim, not immunity: every fatal has come from a previously-identified slot — cor04 GPU5 `a0:01.1` (SDES, silent, **zero correctables in all 38 runs**) + GPU0 `00:01.1` (ERR_FATAL, correctable-generating); rgca17 gpu6 `34:10.0`; rgca18 gpu4 `2b:10.0`. **Correction:** the RGCA victims are not merely "different physical slots on identical boards" — `pcie_link_rootports.csv` is byte-identical on both nodes and shows a three-tier cascade in which both victims are **homologous branch positions**: 5 hops deep, behind third-tier switch `29`, on a leaf port ending `:10.0`, a set with exactly 2 of 8 members. Null probability (2/8)² = 0.06, feature chosen post hoc. No intermediate hop ever logged an error, so depth is a proxy for physical placement on the switchboard, not for accumulated jitter. **Junction temperature is excluded as the slot term** — see the thermal-rank table: all three victims sit at or behind two hotter, error-free slots except cor04 gpu5, and cor04 gpu0 fails from T-rank 4.00 with the node's second-lowest thermal swing. | read-only `Lane Error Status` / `LnkSta2` on the four implicated links **and on their same-branch peers `2b:00.0` / `2f:00.0`**, which the cascade map turns into a matched within-branch comparison available on both RGCA nodes; then card/slot swap using the direction split (h13) to interpret. |
 | 7 | Topology class (riser vs switchboard). | **Confirmed, distinct in both mechanism and blast radius.** COR04 faults are `SDES`/`ERR_FATAL` with no precursor and contain 1 GPU. RGCA's fault ran a 200 s correctable ramp first and, because all eight GPUs sit behind the single root port `1a:01.1`, containment took **all 8** down with `device recovery failed`. | never pool the classes; compare within class only |
 
 **New this round, not previously on the ledger:**
@@ -759,19 +1200,26 @@ scratched rounds have been dropped where real data now exists.
 | # | Hypothesis | Basis | Next test |
 |---|---|---|---|
 | 8 | **PHY/SerDes margin falls as cap clipping rises** (term C). | **Downgraded: clipping fraction fails as a general metric** — r(clip%, AER) = +0.20, r(clip%, fault) = +0.03 over 26 runs; rgca17 ran 100% clipped at 574 W clean, lgc2100 faulted at 0% clip. What survives is within-slot: cor04 GPU0's BadTLP scales inversely with cap (450 W: 32k/4k; 575 W: 1/922), and only under the 8192 workload. | If pursued, pursue it per-slot on cor04 GPU0 with cap as the only variable; do not use clipping fraction as a fleet metric. |
-| 9 | **Large coherent current transitions trigger the fatal, on either edge.** | Both rgca18 faults sat on one: #4 with all eight GPUs clipping at 577–587 W (~4.6 kW coherent), #5 one second after ~2 kW was shed to idle. The workload steps all eight GPUs together by ~800 W inside a single 100 ms sample. **Weak: the other four fatals (all cor04) were mid-load, and correctable-error timing clusters at release in only 2 of 7 runs.** Supporting circumstantial evidence from outside this corpus: `dcgmi diagnostic` reproduces and drives all GPUs from one process; `gpu-burn` uses the same GEMM loop from independent per-GPU processes and has never reproduced. | N × 100 s runs vs 1 × 600 s at equal total load — if the release edge matters, fault probability scales with the number of teardowns. Also `--rank-stagger 5` to de-correlate the steps across ranks, never yet run. |
-| 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | hivenet reported zero servers down over 28 days; the fault corpus is entirely `tenant: fal` baremetal. Both tenants share the `cor`, `rgca` and `roca` sites, so site and topology class are *not* the difference. `perfvm_host` membership sets `kernel_iommu: true` → GRUB IOMMU + VFIO, which routes error recovery through `vfio-pci` rather than the NVIDIA RM. We already know `_OSC` AER/DPC ownership varies across this fleet with identical board and BIOS. | Enable IOMMU on a test node via kernel cmdline — no code, no new instrumentation — and re-run a known-reproducing arm. **First, though, resolve the two cheaper questions below: the comparison may be an artifact.** |
+| 9 | **Large coherent current transitions trigger the fatal, on either edge.** | **Reframed by the 38-run re-read: the pattern is real but it is rgca18-specific and it is about elapsed load time, not necessarily the edge.** All three terminal events that node has ever had landed within 20 s of 600 s of load — fault 4 at 598.1 s (1.9 s *before* load end), fault 5 at 608.8 s, and the previously-unflagged host crash at ≥589.3 s. Under a uniform hazard over a 600 s run that is p ≈ 3.7 × 10⁻⁵ for all three. cor04's seven faults sit at 10–47% of their load phases and rgca17's at 34%, so nothing generalises off rgca18. **The important consequence is a design defect, not a mechanism: every rgca18 run in the corpus is censored at almost exactly the point where its hazard concentrates**, so its eight `clean` verdicts carry far less information than their count suggests. Amplitude also sits against this: the pl450-warm fatal had the *lowest* PSU current swing of any 8192 run (55.8 A). | **One 1200 s run on rgca18, same arm.** "Release edge" and "~600 s of cumulative exposure" are indistinguishable while every run is 600 s: a fault near 600 s means cumulative exposure with a knee at ten minutes, near 1200 s means the release transition, no fault falsifies both. Cheaper and cleaner than N × 100 s, which moves teardown count and per-run exposure together, and it simultaneously tests whether the wrapper's own post-load config-space sweep across ~17 devices is the provocation. `--rank-stagger 5` still never run. |
+| 11 | **IOMMU/VFIO changes the PCIe error-handling path**, so a passthrough host survives what a baremetal host does not. | **The IOMMU limb is REFUTED by the existing corpus; only the error-path limb survives.** Every node in the fault corpus already boots `amd_iommu=on iommu=pt` and reports `iommu: Default domain type: Passthrough` with IOMMU groups populated, on all 38 runs, with no `vfio` anywhere — and faults 10 times anyway. The proposed test had therefore been running all along. Two details from the same lines: the kernel answers `AMD-Vi: Unknown option - 'on'`, so `amd_iommu=on` is a no-op token and `iommu=pt` is what took effect; and the RGCA nodes additionally carry `pci=realloc=off,hpmemsize=0,hpiosize=0` while cor04 does not — a topology-class platform difference not previously recorded, and one that bears on re-enumeration after DPC. | What is left needs `vfio-pci` binding and guest-scoped containment, not a kernel-cmdline change. **Cheaper substitute available on the MGX box:** if `_OSC` AER/DPC ownership is a BIOS setting there as it is on the fleet, toggling firmware-first ↔ OS-first on identical hardware under identical load isolates the error-handling path as a single reversible variable, without needing a guest at all. |
 | 12 | **Transient count, not exposure time, drives the fault** — the rate of coherent current *edges* rather than how long the load runs. | **REFUTED, and this is the investigation's first properly controlled single-factor test.** ~90x more coherent current edges at matched duty cycle and matched PCIe traffic changed time-to-fault by 11% (107 s -> 95 s) on cor04. A transient-count mechanism predicts TTF collapsing toward ~1 s. The arm also overshot power by 9% (541 vs 496 W), so it was *harsher* than the reference and still did not fault meaningfully faster. Together with hypothesis 1 (100x *less* dispatch -> worse), the transient-rate family is now empty in both directions. | Closed. n=1 per arm and exponential TTF gives +/-100% on a single event, so the 11% itself is noise — but the *absence* of a 90x effect is not a subtle inference. Reopen only with a mechanism that survives both refutations. |
-| 13 | **The failing direction is uniformly GPU→upstream (GPU TX / board RX).** The marginal element is on the GPU side of every link: its transmitter, its PHY supply, or the TX pairs of its connector path. | Corpus-wide aggregation of all 27 runs' AER tables: upstream-facing receivers logged **697,865 RxErr / 93,547 BadTLP / 6,274 BadDLLP**; GPU (dev) rows logged **zero** of all three, while logging 959 Rollover — so their AER reporting works and the zero is real. The story is coherent: GPU transmits bad → receiver logs RxErr/BadTLP → GPU replays → GPU Rollover. Sole exception: 58 Rollover on `34:10.0` (downstream TX) in the one bad-training run, 0.008% of the corpus. Both fatal classes fit too: `SDES` = the root port stops hearing the GPU; `ERR_FATAL received from <GPU>` = the GPU reports its own escalation. Also explains the BMC symptom: host-side receivers seeing bad data is what IPMI misreads as PERR/SERR. | **First verify the zero is not a mask artifact:** AER correctable masks are per-bit, so a GPU reporting Rollover does not prove RxErr/BadTLP are unmasked — read the `CEMsk:` line via `lspci -vvv` on a GPU. If RxErr is masked there, h13 needs re-grounding. **Checked on the MGX PRO 6000 under driver 595: CEMsk all clear — spec default, nothing masked.** The fleet 5090/580 check (OS-first, where the kernel could set masks) is still pending and remains the authoritative one. Then: on a card/slot swap (h6's test), direction sharpens the interpretation: if errors follow the card, GPU TX PHY or its supply; if they stay with the slot, the slot's RX path or the connector TX pairs. Read-only now: `Lane Error Status` on the three implicated receiving ports localizes which lanes take the hits. |
-| 14 | **Cumulative wear, not within-boot soak** — repeated faults/containments progressively degrade the marginal slot, and h4's "uptime" is proxying it. | The cap-575 TTF decline on cor04 (282 → 214 → 107 → 95 s) spans **four different boots**, so within-boot uptime, wall-clock campaign time, cumulative fault count (0, 1, 2, 4 prior), and ambient time-of-day all rise together across it — the series cannot distinguish them. Weak counter-evidence: GPU0's BadTLP at pl450 *fell* from 32,275 (early) to 3,954 (late). Ambient is entirely unmeasured. **First re-run landed:** TTF 65.6 s vs 282.2 s at matched 494 W and matched uptime — direction matches wear, but it is a single draw with ~21% probability under the constant-hazard null, and the refit keeps the wear MAP at zero. | Cheap and near-decisive: re-run `baseline-uncapped` exactly, at matched ~700 s uptime. Wear predicts TTF ≪ 282 s; soak predicts ≈ 282 s. Also start logging BMC inlet temperature per run — one `ipmitool sdr` read in the wrapper — to kill the ambient confound. |
+| 13 | **The failing direction is uniformly GPU→upstream (GPU TX / board RX).** The marginal element is on the GPU side of every link: its transmitter, its PHY supply, or the TX pairs of its connector path. | **Mask prerequisite RESOLVED on fleet hardware — h13 now stands on the data.** The kernel printed the register itself every time a GPU endpoint logged: `nvidia 0000:01:00.0`, `0000:2d:00.0` and `0000:36:00.0` all show `status=0x00001100 mask=0x00001000`, i.e. **only Replay Timer Timeout masked; RxErr (bit 0) and BadTLP (bit 6) unmasked and clear**, while their upstream receivers show exactly the opposite bits set. This is stronger than the counter argument it replaces: the status register latches regardless of the mask, so the GPU rows are not un-incremented counters — the GPU's own hardware recorded no receive errors at the moment it reported. Corpus-wide over all 38 runs, deduped by port: **697,979 RxErr / 94,989 BadTLP / 6,275 BadDLLP** on upstream receivers against **zero of all three** on GPU endpoints, which logged 988 Rollover (their own replay timer). Only 4 ports of 40 have ever logged a correctable error. Reading caution: the `a0:01.1` dump showing `mask=0x00000000` belongs to an *Uncorrectable* error block, so it is the uncorrectable mask register, not a correctable-mask anomaly. **The earlier "checked on the MGX PRO 6000 under driver 595: CEMsk all clear" is withdrawn** — that reading was taken on the box later found to be running a root-level rootkit, and that unit has since been swapped out. | The `lspci -vvv` `CEMsk` check is no longer a gate. Next: `Lane Error Status` (Secondary PCIe cap, and again in the 32 GT/s Physical Layer cap) on the implicated receiving ports plus their same-branch peers, to localise which lanes take the hits; then the card/slot swap, where direction sharpens the interpretation — errors following the card implicate GPU TX PHY or its supply, errors staying with the slot implicate the slot's RX path or the connector TX pairs. |
+| 14 | **Cumulative wear, not within-boot soak** — repeated faults/containments progressively degrade the marginal slot, and h4's "uptime" is proxying it. | **Strongest association in the corpus, and newly confounded by a kernel upgrade.** The power-matched cor04 `baseline-uncapped` triple is matched to 1 W of mean power, 2 MHz of mean clock, 5 MHz of clock sd, 0 MHz at p98 and 2 °C of ambient, and TTF fell 282.2 → 65.6 → 60.7 s. Over the fault set r(prior fatals, ln TTF) = **−0.86** pooled, **−0.88** within cor04, against r(power, ln TTF) = −0.21. Two rival covariates are now eliminated: within-boot uptime rose across the triple while TTF fell (pooled r(ln uptime, ln TTF) = **+0.35**, wrong sign for soak), and **ambient is no longer unmeasured** — the coldest pre-load idle GPU temperature in every bundle is a usable proxy, giving r(ambient, fault) = +0.06, 21.3 °C mean on faulting runs vs 21.1 °C clean, and only 2 °C of movement across the triple. **But cor04's kernel went `7.0.0-28` → `7.0.0-29` mid-campaign while both RGCA nodes stayed on `-28`, and kernel version is not a recorded run variable.** Every long-TTF cor04 fault (282, 214, 107, 224 s) is on `-28` and every short one (95, 66, 61 s) is on `-29` — a perfect separator, cleaner than prior-fault count, which has the 224 s fault out of order. Mitigating: the two boots' `_OSC` (26), `DPC` (44) and `ASPM` (8) line counts and command lines are identical, so error-handling configuration did not change — but the NVIDIA module was rebuilt. Under a constant hazard with mean 282 s, two consecutive draws ≤ 66 s have p = 0.040. | **Cheapest decisive run in the plan: boot cor04 on `7.0.0-28` and repeat `baseline-uncapped` at ~700 s uptime.** TTF back near 200–280 s implicates the kernel and dissolves the wear staircase; still near 60 s removes the kernel and leaves wear vs campaign-time. One reboot, no code. Then re-run the survival fit with a kernel term, with the two reclassified runs, and with rgca18's wear corrected to 2. Record `uname -r` in the manifest from now on. |
 | 15 | **The soak variable is idle link-state residency / training age, not time or temperature.** GPUs autonomously downtrain to gen1 while idle; hours of idle-at-gen1 (or a stale training) may be what erodes the link, and retraining may reset it. | The pl450-warm fault (TTF 224 s at 33,347 s uptime) followed **~9 h of idle** — the node was at ambient temperature at load start, so whatever "soak" is, it survives complete thermal relaxation and **cannot be junction/board temperature**. What does persist across 9 h idle: link-training age, idle gen1 residency, driver/GSP state age. | Before a warm run, force a retrain (`setpci CAP_EXP+10.w=0020:0020` on the implicated ports, confirm gen5 x16 via `linkcheck.sh`), then run the arm. TTF back at cold values → training age/residency is the mechanism and a periodic retrain is a cheap fleet mitigation. TTF still short → driver/system state age or wear (h14). |
-| 16 | **Thermal-cycle depth/count, not temperature level** — each cold→hot→cold excursion is one fatigue/fretting cycle; idle time matters as *cycle depth*, not as elapsed time. | Re-explains the 9 h-idle fault as the campaign's deepest thermal relaxation followed by full reheat, and gives h14 a physical mechanism (thermo-mechanical micro-motion → fretting at the connector, whose card-TX pins sit in their own physical group → tracks h13's direction uniformity). Constraints already in hand: fault timing rules out an instantaneous dT/dt trigger (4 of 6 faults landed well after thermal settle), and the h12 pair disfavours per-pass micro-cycling (13.5x more, shallower cycles → Coffin–Manson predicts *less* damage/s, observed TTF unchanged). Run-level ΔT is collinear with power at fixed cooling, so the corpus cannot test this observationally. | The 2x2 that separates h15 from h16 on a long-idled cor04, same arm: {retrain, no-retrain} x {pre-warm 10 min light load, cold start}. h15 predicts retrain rescues regardless of warmth; h16 predicts pre-warming rescues regardless of retrain. Also the cycle-count arm: 6 x 100 s with ~5 min cool-down gaps vs 1 x 600 s at matched cap and total load-seconds. |
+| 16 | **Thermal-cycle depth/count, not temperature level** — each cold→hot→cold excursion is one fatigue/fretting cycle; idle time matters as *cycle depth*, not as elapsed time. | Re-explains the 9 h-idle fault as the campaign's deepest thermal relaxation followed by full reheat, and gives h14 a physical mechanism (thermo-mechanical micro-motion → fretting at the connector, whose card-TX pins sit in their own physical group → tracks h13's direction uniformity). Constraints already in hand: fault timing rules out an instantaneous dT/dt trigger, and the h12 pair disfavours per-pass micro-cycling. **Narrowed by the 38-run re-read: the slot-selecting version of h16 is excluded.** Mean per-slot temperature rank across every run with all 8 GPUs in window puts the victims at 1.31 and 4.00 (cor04 gpu5, gpu0), 3.36 (rgca17 gpu6) and 3.00 (rgca18 gpu4) — mean victim rank 2.9 against a null of 4.5, entirely carried by cor04 gpu5, while the second- and third-hottest slots on every node have never produced a single error and cor04 gpu0 fails from mid-pack with the node's second-lowest ΔT. So thermal cycle *depth* does not predict which slot degrades; it may still drive degradation over time. Run-level ΔT remains collinear with power at fixed cooling on the fleet's axial-fan cards. | The 2x2 that separates h15 from h16 on a long-idled cor04, same arm: {retrain, no-retrain} x {pre-warm 10 min light load, cold start}. **Better instrument available on the MGX box:** a passively-cooled server card with BMC fan control breaks the power/ΔT collinearity outright — hold die power fixed and move ΔT by 15–25 °C, or hold temperature fixed and move power. Also the cycle-count arm: 6 x 100 s with ~5 min cool-down gaps vs 1 x 600 s at matched cap and total load-seconds. |
 | 10 | **Per-boot link training outcome sets the link's margin**, independently of workload. | rgca17 GPU6 trained to three different states across three boots (265 s gen1 dwell; clean x16; x8 twice) and its error counts followed the trained state, not the arm. | `linkcheck.sh` at every boot before any load; retrain with `setpci CAP_EXP+10.w=0020:0020` and record whether the state holds. Never compare error counts across boots without recording the trained state. |
 
 
-Observed times-to-fault. Post-freeze, on `933b21f` and therefore usable: **107,
-214, 282, 598 s** (cor04 x3, rgca18 x1). Pre-freeze and indicative only: 77, 117,
-178, 200, 209, 1556 s.
+Observed times-to-fault, post-freeze, all 38 runs. cor04: **60.7, 65.6, 95.1,
+106.9, 214.5, 224.2, 282.2 s** (7). rgca18: **598.1, 608.8 s** (2, the second
+outside its run's capture window), plus a host death at ≥589.3 s of load with no
+verdict recorded. rgca17: **201.4 s** (1). Pre-freeze and indicative only: 77,
+117, 178, 200, 209, 1556 s.
+
+Load exposure and rate: cor04 4,666 s / 7 → 1 per 667 s; rgca18 6,041 s / 2 → 1
+per 3,021 s; rgca17 7,490 s / 1 → 1 per 7,490 s. **No run in the corpus exceeded
+642 s of load**, so every `clean` verdict is bounded at roughly one arm-length —
+and on rgca18 that bound sits exactly where its three terminal events landed.
 
 ---
 
@@ -942,11 +1390,36 @@ zero single passes logged across 1800 s.
 a sawtooth workload showed a pattern that vanished under 5-minute means.
 
 **Establish that a measurement can detect the thing before treating its absence
-as evidence.** `aer_uncorrectable.csv` came back empty and was first explained as
-firmware clearing the registers — until an OS-first node produced the same empty
-file. At 1 Hz the poll simply never catches the bit before DPC contains the link.
-Absence of `SDES` there is not evidence; the kernel log's `ERR_FATAL received
-from <device>` is.
+as evidence — and re-check that judgement when the corpus grows.**
+`aer_uncorrectable.csv` came back empty and was first explained as firmware
+clearing the registers, then as a 1 Hz poll too slow to catch the bit before DPC
+contains the link. **Both explanations were wrong.** Over 38 runs the file holds
+70 rows in all three reason-`00`/SDES faults and zero in all six
+reason-`10`/`ERR_FATAL` faults and all 29 clean runs — a perfect classifier,
+p = 0.012. The emptiness is diagnostic: in the `ERR_FATAL` class the root port
+never records an uncorrectable error of its own, so there is nothing to poll. The
+original discipline is still right, but it cuts both ways — "this instrument
+can't see it" is itself a claim that needs testing against every case, not just
+the ones that came back empty.
+
+**A zero AER counter delta on a run that ended in containment is not evidence of
+no precursor.** This points the opposite way to the `dmesg`-undercount item
+below, and both are true at once. Fault 2 logged a correctable line *and* an
+`ERR_FATAL` on `00:01.1`, yet its `aer_delta.txt` reads **all zero** — the
+post-run counter read happens after the endpoint has gone. Faults 8 and 9 show
+the same shortfall in milder form (3 counts against 8 log lines; 8 against 15).
+So: take magnitudes from the counters, take *existence and sequence* from the
+kernel log, and never infer "no correctables preceded this" from a zero delta on
+a fatal run.
+
+**Check whether an analysis script's own filters silently drop data.**
+`corr_matrix.py` hard-coded `933b21` in its run-directory regex and skipped the
+nine newest runs without warning; its fixed t=60–93 s power window blended
+teardown idle into every short-TTF fault, turning 494 W into 184 W; and it summed
+AER rows without deduping, counting one RGCA root-port event eight times. A
+script that produces a plausible table from a silently truncated corpus is more
+dangerous than one that errors. Print the row count the script actually used and
+compare it against `ls -d runs/2026* | wc -l` before reading any number out of it.
 
 **Render the artifact; do not trust the exit code or file size.** A plotting
 script produced correctly-autoscaled axes with no data drawn at all, because an
@@ -1000,6 +1473,16 @@ fatal containment 8.8 s after the load ended — 5 s after the wrapper's last
 `dmesg_after` snapshot. An entire conclusion ("massive correctable storm with no
 escalation") was built on that false negative and had to be withdrawn. Bound every
 clean verdict by checking the *next* run's `dmesg_before`, which covers the gap.
+
+**A missing artifact is a louder signal than a bad one — audit for absence, not
+just for content.** The corpus's second false negative was found by scanning for
+NUL bytes, not by reading anything: one rgca18 bundle has six live-written files
+truncated to a page boundary, no `dmesg_after.txt`, no `faults.txt`, no
+`aer_delta.txt`, and a manifest with no `verdict` line at all — the host died
+mid-run and every parser downstream read the blank verdict as clean. Before
+analysing a batch, check that every bundle has the same file list and that
+`verdict`/`exit_code` are actually present, and grep the corpus for NUL bytes.
+`if [ -z "$verdict" ]` must never fall through to "clean".
 
 **Check the trained link state before comparing error counts.** rgca17's GPU6 port
 looked like the noisiest link in the fleet on one boot (8018 BadTLP, after dwelling
