@@ -59,8 +59,21 @@ specific card. Put this in the shell that launches every arm:
 
 ```sh
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=GPU-<1a>,GPU-<1b>,GPU-<3f>,GPU-<40>,GPU-<bb>,GPU-<bc>
+# the three healthy pairs: 1A/1B, 3F/40, BB/BC.
+# excluded: 99:00.0 (defective) and its PIX partner 9A:00.0.
+export CUDA_VISIBLE_DEVICES=\
+GPU-e833048e-2953-e92f-5c83-9081030596ad,\
+GPU-016df175-986b-a632-ea79-341ee9d53780,\
+GPU-6f8408fc-8f6e-10cc-f64a-7f3c113c5397,\
+GPU-8371f9c8-04bc-6ee4-ea1f-fd953079027a,\
+GPU-47893b29-f25b-1270-b9b9-45fd94d4a8f2,\
+GPU-e518f8d7-d862-409f-dddf-6f96f227be4c
 ```
+
+For reference, the two excluded cards: `99:00.0` is
+`GPU-4c2698bd-24de-38c8-1dde-a62030124dbf`, its partner `9A:00.0` is
+`GPU-2454d2b3-d22e-9e32-4230-03363aa87b1b`. UUIDs are stable across reboots;
+re-read them with `nvidia-smi -L` if a card is ever replaced.
 
 With that set, `pcieburn` sees six devices and needs no `--gpus`. Use `sudo -E`
 so the wrapper inherits it (already the case in every command below).
