@@ -129,6 +129,47 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+hdr "2b. ECC — an observable the fleet structurally does not have"
+# The fleet's RTX 5090s are consumer parts with no ECC, so memory errors there
+# are undetectable except through pcieburn's own GEMM comparison (faulty/nan),
+# which has been zero in 38 of 38 runs. This SKU has ECC, which means:
+#   - it can report memory faults the fleet would never surface, and
+#   - ECC mode is itself a run variable. It costs memory bandwidth, which moves
+#     duty cycle, which moves power. Toggling it makes a NEW arm, not the same
+#     arm at a different setting. Record the mode with every run.
+# An uncorrectable error here is a memory-subsystem fault, NOT a link fault.
+# Do not fold it into the PCIe corpus.
+if have nvidia-smi; then
+    cap "ECC state"      ecc.txt          nvidia-smi -q -d ECC
+    cap "row remapper"   row_remapper.txt nvidia-smi -q -d ROW_REMAPPER
+    say ""
+    say "  ECC mode (current/pending) per GPU:"
+    grep -E 'Ecc Mode|Current|Pending' "$OUT/ecc.txt" 2>/dev/null | head -12 | sed 's/^/    /' \
+        || say "    not reported"
+    say ""
+    say "  ECC-related query fields this driver exposes:"
+    nvidia-smi --help-query-gpu 2>/dev/null | grep -iE 'ecc|remap|retired' \
+        | sed 's/^/    /' | head -20 || say "    none"
+    say ""
+    say "  Counters (enumerate the field names above before trusting these):"
+    for f in ecc.errors.uncorrected.volatile.total \
+             ecc.errors.uncorrected.aggregate.total \
+             ecc.errors.corrected.volatile.total ; do
+        if nvidia-smi --help-query-gpu 2>/dev/null | grep -q -- "$f"; then
+            nvidia-smi --query-gpu=index,"$f" --format=csv 2>&1 | sed 's/^/    /'
+        else
+            say "    ABSENT: $f"
+        fi
+    done
+    say ""
+    say "  Any nonzero UNCORRECTABLE count, or any pending row remap, means this"
+    say "  box is not a clean comparison platform until it is resolved. Localise"
+    say "  it with 'dcgmi diag -r 2' before running any pcieburn arm."
+else
+    say "  nvidia-smi not present — ECC section unavailable"
+fi
+
+# ---------------------------------------------------------------------------
 hdr "3. PCIe error-handling ownership — THE GATE for this platform"
 # _OSC ownership is a BIOS setting: it differed between COR04 and RGCA with
 # identical board and identical BIOS version. If it is settable on the MGX box,

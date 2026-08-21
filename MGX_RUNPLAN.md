@@ -9,6 +9,12 @@ anything drifts.
 Two standing constraints on this platform: **driver 595, kernel 6.8 generic**,
 neither ours to change.
 
+> **Open issue, 2026-08-21.** The first run on this box reported an
+> **uncorrectable ECC error at iteration 0**. That is a memory-subsystem fault,
+> not a link fault, and it must not be folded into the PCIe corpus — but it does
+> mean the box is not yet a clean comparison platform. **Work through
+> "ECC triage" below before running any arm in this plan.**
+
 ---
 
 ## 0. Before anything: build, then preflight
@@ -29,6 +35,108 @@ without having watched the instrument work somewhere it does.
 **Stop and read section 3 of the preflight output before running any load arm.**
 If it reports firmware-first, check the BIOS for an AER/WHEA ownership option.
 That toggle is worth more than any single arm below.
+
+---
+
+## 0b. ECC triage — blocking, do this before any arm
+
+An uncorrectable ECC error is a **different subsystem** from the PCIe link fault
+this investigation is about. It gets triaged on its own terms and kept out of the
+fault corpus. Two reasons it still blocks everything: a card with a memory defect
+is not the clean same-die/different-board comparison the whole platform plan
+rests on, and if it recurs mid-arm it will terminate runs for a reason unrelated
+to what the arm is testing.
+
+### The one question that sets the severity
+
+Did `pcieburn`'s own GEMM comparison see corrupted results, or did ECC contain it?
+
+```sh
+D=$(ls -1dt ~/pcieburn/runs/*/ | head -1); echo "$D"
+# events.csv fields: 11 = faulty, 12 = nans
+awk -F, 'NR==1 || $11+0>0 || $12+0>0' "$D/events.csv" | head
+grep -iE 'faulty|nan' "$D/pcieburn.log" | tail -20
+```
+
+- **`faulty` / `nans` still zero** → ECC did its job: it detected and reported
+  rather than letting bad data through. Bad news about the card, no change to the
+  investigation's standing claim.
+- **`faulty` or `nans` nonzero** → this is the **first data corruption observed
+  anywhere in this investigation**, across 38 fleet runs plus this one. Flag it
+  distinctly and loudly; it is a materially more serious class of finding than
+  anything in the corpus, and it does not belong in the same bucket as the link
+  fault.
+
+### What the kernel and driver saw
+
+```sh
+sudo dmesg --ctime | grep -E 'Xid|NVRM|ECC' | tail -40
+nvidia-smi -q -d ECC          | sed -n '1,80p'
+nvidia-smi -q -d ROW_REMAPPER
+nvidia-smi --help-query-gpu | grep -iE 'ecc|remap|retired'   # enumerate first
+```
+
+Xid codes to look up rather than assume — check each against NVIDIA's Xid table,
+because the meaning differs by architecture: **48** (double-bit ECC), **63 / 64**
+(row-remap recording, and recording *failure*), **92** (high single-bit rate),
+**94 / 95** (contained / uncontained ECC error). The contained-versus-uncontained
+distinction is the one that matters most: *contained* means the blast radius was
+one process, *uncontained* means the GPU's state is untrustworthy until reset.
+
+Then check whether a remap is pending. A pending row remap needs a GPU reset to
+apply, and until it applies the same address will keep failing:
+
+```sh
+nvidia-smi -q -d ROW_REMAPPER | grep -iE 'pending|failure|remapped'
+sudo nvidia-smi -r -i <N>          # per-GPU reset; needs no compute clients
+```
+
+### Localise it before deciding
+
+```sh
+sudo dcgmi diag -r 2 2>&1 | tee dcgmi_r2_ecc.log     # includes the memory tests
+sudo dcgmi diag -r 3 -p "diagnostic.is_allowed=true" 2>&1 | tee dcgmi_r3_ecc.log
+```
+
+### Why iteration 0 is informative rather than alarming on its own
+
+`pcieburn` defaults to `--mem-frac 0.9`, so it allocates 90% of remaining VRAM
+for C matrices and **iteration 0 is the first time nearly the whole framebuffer
+gets touched**. On a 96 GB card that is a large first-touch sweep. An
+uncorrectable error there reads much more like a pre-existing bad cell that only
+a full-VRAM pass reaches than like load-induced degradation — the load had not
+had time to do anything yet. That also means the harness is incidentally a
+first-touch VRAM exerciser, which is worth knowing but is not a substitute for a
+real pattern-based memory test.
+
+### Decision
+
+| finding | action |
+|---|---|
+| reproduces on one GPU after reset and remap | that card is an RMA. Do not use this box for board comparison until it is replaced — a defective part invalidates the one property that made it valuable. |
+| clears after reset + row remap, does not return over ~3 × 3600 s idle-plus-load | usable, but record the remap in every subsequent run's sidecar; a remapped row is a permanent change to the part under test. |
+| reproduces on multiple GPUs | suspect the platform or the driver-595/kernel-6.8 pairing, not the cards. Check whether ECC mode is even fully supported in that combination before blaming hardware. |
+| `faulty`/`nans` nonzero | stop, preserve the bundle, and treat it as its own finding. Do not continue the arm plan on this box. |
+
+### A workaround that is not free
+
+Excluding the affected GPU with `--gpus 0,1,2,3,4,5,6` keeps the box usable, but
+it is **a new arm, not the same arm**: seven ranks change the collective shape,
+the coherent power step, and the per-switch load distribution. Record it as its
+own arm label and never compare it against an 8-GPU run.
+
+Likewise, disabling ECC to work around this changes memory bandwidth, which
+moves duty cycle, which moves power. Same rule: new arm, not the same arm at a
+different setting. Record `Ecc Mode: Current` in the sidecar either way.
+
+### One angle worth watching, not asserting
+
+Card-local power delivery is the one plausible common cause for memory errors and
+PHY errors on the same board — it is mechanism 2 in the ledger's ranking
+(GPU-local PHY supply disturbance from the card's own load transients). If ECC
+error rate on this box turns out to scale with the power cap, that is worth
+following. At iteration 0 on a first run, though, a defective memory device is
+far more likely, and a single event cannot distinguish them. Do not build on it.
 
 ---
 
