@@ -7,3 +7,13 @@
 # machine this is authored on has no CUDA toolchain (see README "Build").
 /pcieburn
 *.o
+
+# mgx_preflight.sh output. Same reasoning as /runs/ — these are captured
+# artifacts (a full `lspci -vvv` alone is hundreds of kB), not source.
+/preflight-*/
+/boot-*/
+/ambient_vs_proxy.csv
+/dcgmi_r3.log
+
+# Scratch PR description, regenerable from the commit messages.
+/PR_BODY.md

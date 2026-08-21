@@ -40,6 +40,10 @@ DATA = [
     ("cor04",   812, 494, 5,  65.6, 1),   # baseline rerun @~700s: FAULT (GPU0, ERR_FATAL)
     ("rgca17", 4078, 417, 0, 600.0, 0), ("rgca17",  807, 397, 0, 600.0, 0),
     ("rgca18", 4078, 417, 2, 600.0, 0), ("rgca18",  839, 394, 2, 600.0, 0),
+    # up700s repeat 2 (2026-08-20, actual uptimes ~1500 s)
+    ("cor04",  1499, 493, 6,  60.7, 1),   # GPU0 ERR_FATAL again
+    ("rgca17", 1495, 402, 0, 201.4, 1),   # FIRST rgca17 fault: gpu6 ERR_FATAL
+    ("rgca18", 1527, 398, 2, 600.0, 0),
 ]
 NODES = ["cor04", "rgca17", "rgca18"]
 A_GRID  = [(-14.0 + 0.5 * i) for i in range(21)]          # ln base hazard /s
