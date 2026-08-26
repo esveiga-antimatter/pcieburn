@@ -46,8 +46,17 @@ write, and a PMBus write to a live supply (OPERATION, VOUT_COMMAND, ...) can
 reconfigure or shut it down. This script hard-codes a read-only allowlist and
 refuses anything outside it.
 
-UNTESTED AGAINST HARDWARE. Written from ASRock's example plus the PMBus spec;
---validate exists precisely because none of it has been confirmed on a machine.
+CONFIRMED ON HARDWARE (cptroca25, 2026-08-26). 70 rounds, 100% read success,
+0.250 s mean/median/p95 interval with zero gaps -- 4 Hz steady, against the older
+BMC-sensor poller's ~1 Hz with dozens of multi-second gaps per run. Per-supply
+efficiency came out 89.9-93.1% (system 91.3%), which is where a CRPS unit belongs
+and is strong evidence that 0x96 really is READ_POUT and that the LINEAR11 decode
+is right -- four independent supplies would not all land in the correct band by
+accident. PSU3 and PSU4, invisible to the BMC, read normally.
+
+Still worth running --validate once per platform: the efficiency check confirms
+the command codes and the decode, but only the BMC cross-check confirms the
+ADDRESS MAP, i.e. that 0xb0 is the supply the BMC calls PSU1.
 """
 
 import argparse
