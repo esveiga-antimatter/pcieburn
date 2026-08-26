@@ -57,18 +57,19 @@ Wrapper options:
                       can rank configurations without having to reach a fault
                       and reboot. Strongly recommended.
   --aer-interval SEC  AER poll interval (default 1)
-  --with-psu          poll per-PSU output CURRENT via IPMI. On this platform
-                      CUR_PSU*_IOUT is the only power sensor with adequate
-                      range: PWR_*_PIN wraps at 255 W and PWR_*_POUT saturates
-                      near 510 W, so both (and DCMI, which derives from PIN)
-                      read garbage above idle. Current does not.
-  --with-psu-pmbus    poll per-PSU INPUT and OUTPUT POWER for all four supplies
-                      over the ASRock PMBus bridge, via psu_pmbus_poll.py. The
-                      BMC surfaces sensors for only two of the four, so
-                      --with-psu can measure half the chassis and must estimate
-                      the rest; this reads all four directly. Confirmed on
-                      hardware: 4 Hz steady, 100% read success, per-supply
-                      efficiency ~95%. Read-only PMBus commands throughout.
+  --with-psu          poll BOTH PSU channels: the BMC current sensors and PMBus.
+                      They are complementary -- PMBus reads all four supplies,
+                      the BMC sensors are the only independent cross-check on
+                      the two it can see. Of the BMC's channels only
+                      CUR_PSU*_IOUT has adequate range: PWR_*_PIN wraps at
+                      255 W, PWR_*_POUT saturates near 510 W, and DCMI derives
+                      from PIN, so all three read garbage above idle.
+  --with-psu-pmbus    PMBus only, without the BMC sensors. Implied by --with-psu;
+                      use alone if the BMC sensor path is broken on a platform.
+                      Reads per-PSU input and output power for all four supplies
+                      over the ASRock bridge via psu_pmbus_poll.py -- read-only
+                      commands, 4 Hz, confirmed on hardware. Aggregate the CSV
+                      with medians; the summary at the end does this for you.
   --psu-interval SEC  PSU current poll interval, both pollers (default 0.25)
   --active-supplies N assumed number of load-sharing PSUs, used only for the
                       estimated system power column (default 4, from measured
@@ -115,7 +116,7 @@ while [[ $# -gt 0 ]]; do
         --with-dmon)     WITH_DMON=1; shift ;;
         --with-aer)      WITH_AER=1; shift ;;
         --aer-interval)  AER_INTERVAL="$2"; shift 2 ;;
-        --with-psu)      WITH_PSU=1; shift ;;
+        --with-psu)      WITH_PSU=1; WITH_PSU_PMBUS=1; shift ;;
         --with-psu-pmbus) WITH_PSU_PMBUS=1; shift ;;
         --psu-interval)  PSU_INTERVAL="$2"; shift 2 ;;
         --active-supplies) ACTIVE_SUPPLIES="$2"; shift 2 ;;

@@ -116,10 +116,12 @@ source review. None depends on which `pcieburn` binary ran, so all of it stands.
 
 **Instrumentation limits**
 
-- PSU watt sensors are unusable above idle: `PWR_*_PIN` wraps at 255 W,
-  `PWR_*_POUT` saturates near 510 W, and DCMI derives from `PIN` (it printed
-  `3 W` at load onset). `CUR_PSU*_IOUT` is the only in-range power channel;
-  multiply by the measured 12 V rail.
+- PSU watt sensors *via the BMC* are unusable above idle: `PWR_*_PIN` wraps at
+  255 W, `PWR_*_POUT` saturates near 510 W, and DCMI derives from `PIN` (it
+  printed `3 W` at load onset). `CUR_PSU*_IOUT` is the only in-range BMC power
+  channel; multiply by the measured 12 V rail. **Superseded for real power by the
+  PMBus channel below**, which reads all four supplies directly and does not
+  saturate.
 - BMC `CurConsumedWatts` is a torn read — it changed in 189 of 326 samples while
   the sensors feeding it changed ~56 times.
 - NVML `power.draw` refreshes only every ~0.5–1.2 s despite 100 ms polling, so
@@ -1337,6 +1339,59 @@ a single test run. Ask before building the arms above.
 
 ---
 
+## Per-PSU power over PMBus (`psu_pmbus_poll.py`)
+
+The BMC surfaces sensors for only two of the four supplies, so every system-power
+figure before this was an *estimate* extrapolated from that pair —
+`run_pcieburn.sh` names the column `est_system_w` for exactly that reason. The
+ASRock OEM bridge reads all four directly:
+
+    ipmitool raw 0x3a 0x52 0x0c <addr> 0x02 <pmbus_cmd>
+
+with PSU1–4 at 8-bit addresses `0xb0/0xb2/0xb4/0xb6` on bus `0x0c`, `0x97` =
+`READ_PIN`, `0x96` = `READ_POUT`, values in PMBus LINEAR11. `--with-psu` now
+launches this alongside the BMC capture; `psu_pmbus.csv` lands in the run bundle.
+
+**Confirmed on cptroca25.** 4 Hz steady, 100% read success, per-supply efficiency
+95.3–95.4% (Titanium-class, which is what validates the decode — four supplies do
+not land in the right band by accident). At idle it reconciles with NVML to within
+30 W across separate idle periods. `--scan` finds nothing beyond the four named
+addresses: `0xb8`–`0xbe` all reject the command.
+
+**Aggregate with medians, split by regime.** The four reads in a round are ~30 ms
+apart and the file sums them, so one stale-low read drags a sum down while lifting
+it needs all four high. On a 183 s steady-load run, 288 of 658 summed samples
+(44%) fell *below* the concurrent GPU-only draw — impossible — and the mean sat
+478 W below the median. Per-sample efficiency reaches 285% under load for the same
+reason: POUT and PIN within a round are not simultaneous either. None of this
+appears at idle, where the distribution is tight (median 89.7%, max 95.3%). The
+wrapper's end-of-run summary does the median-and-split automatically.
+
+**Sensor bandwidth: ≥4 Hz, ceiling unknown.** Under a varying load values change
+on 79–88% of polls (mean run 1.14–1.26 samples); at idle only 19–33%. The idle
+repeats are constant load plus quantization (1.0 W on PIN, 0.25 W on POUT), not a
+slow ADC. Do not push the rate: the moment this data matters most is a fault, when
+the BMC is also logging SEL entries, and 80 transactions/s of extra housekeeping
+risks perturbing the event.
+
+**Retraction.** An earlier reading of the first load capture concluded that
+additional supplies come online as load rises, from a POUT-vs-GPU slope of 0.92
+below 1 kW and 0.27 above 2.5 kW. `--scan` disproves it — there are only four
+supplies — and the piecewise slope was the summing artifact above. Nothing in the
+corpus depends on the claim.
+
+**Open: NVML appears to over-report GPU board power by ~8%.** After switching to
+medians, the steady-load run leaves a residual that an ~8% NVML over-read
+reconciles exactly, across idle and load together. Recorded as a working estimate,
+not a measurement — it assumes rest-of-system is roughly constant, and settling it
+needs a metered PDU or a clamp on the 12 V cables. **It does not threaten any
+conclusion in this file:** every result here is a comparison between NVML readings
+under identical instrumentation, so a common scale factor cancels. It would only
+move absolute figures — the coherent-current step in hypothesis 9, per-GPU power
+against the 575 W cap, and headroom margins.
+
+---
+
 ## Hypothesis ledger
 
 Status is post-freeze evidence only. "Prior indication" columns from the
@@ -1643,6 +1698,15 @@ latency plus the sleep — with dozens of gaps over 1 s and several spurious >50
 current drops per run. One such bad read appeared 2.7 s before a fault and looked
 like a precursor; NVML showed system power flat across the same moment. The series
 is usable for envelopes, not for event correlation.
+
+**Sum-of-sensors traces need medians, not means.** `psu_pmbus.csv` sums four
+supplies read ~30 ms apart, so a single stale-low reading drags the total down
+while lifting it takes all four high — a one-sided low tail that made 44% of
+loaded samples fall below the concurrent GPU-only draw and put the mean 478 W
+under the median. The same asymmetry applies to any derived column built from
+several non-simultaneous reads. Check for physically impossible values (a total
+below a known component of it, an efficiency above 100%) before trusting an
+aggregate.
 
 **A `clean` verdict is a claim about the capture window, not about the hardware.**
 rgca18's 600 s run at 450 W reported `clean` with `exit_code 0` and then took a
