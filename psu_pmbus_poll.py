@@ -99,13 +99,25 @@ def build_batch(psus, cmds):
 
 
 def run_batch(args, lines):
-    """Run the batch; return 16-bit words, or None if the round is unreliable.
+    """Run the batch; return (words, err). words is None when the round is
+    unreliable, and err then carries WHY -- ipmitool reports every failure on
+    stderr and prints nothing to stdout, so discarding stderr (as an earlier
+    version did) turns a one-line diagnosis into thousands of blank rows.
 
-    Alignment matters. A failed read prints to stderr and emits no stdout line,
-    which would silently shift every later value onto the wrong PSU. So a round
-    is accepted only when the hex-line count equals the command count --
-    attributing PSU4's power to PSU3 would be far worse than a gap in the trace.
+    Alignment matters. A failed read emits no stdout line, which would silently
+    shift every later value onto the wrong PSU. So a round is accepted only when
+    the hex-line count equals the command count -- attributing PSU4's power to
+    PSU3 would be far worse than a gap in the trace.
     """
+    if args.no_batch:
+        words = []
+        for one in lines:
+            w, err = _run_one(args, one)
+            if w is None:
+                return None, err
+            words.append(w)
+        return words, ""
+
     with tempfile.NamedTemporaryFile("w", suffix=".ipmi", delete=False) as fh:
         fh.write("\n".join(lines) + "\n")
         path = fh.name
@@ -113,7 +125,7 @@ def run_batch(args, lines):
         p = subprocess.run(ipmi_prefix(args) + ["exec", path],
                            capture_output=True, text=True, timeout=args.timeout)
     except subprocess.TimeoutExpired:
-        return None
+        return None, "timeout"
     finally:
         os.unlink(path)
 
@@ -123,9 +135,48 @@ def run_batch(args, lines):
             continue
         b = [int(x, 16) for x in ln.split()]
         if len(b) < 2:
-            return None
+            return None, f"short response: {ln.strip()!r}"
         words.append(b[0] | (b[1] << 8))     # PMBus is little-endian
-    return words if len(words) == len(lines) else None
+    if len(words) == len(lines):
+        return words, ""
+    err = " | ".join(l.strip() for l in p.stderr.splitlines()[:2]) or \
+          f"got {len(words)} of {len(lines)} responses, no stderr"
+    return None, err
+
+
+def _run_one(args, cmdline):
+    """One raw command, one ipmitool. Slower, but isolates which read fails."""
+    try:
+        p = subprocess.run(ipmi_prefix(args) + cmdline.split(),
+                           capture_output=True, text=True, timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    for ln in p.stdout.splitlines():
+        if HEXLINE.match(ln):
+            b = [int(x, 16) for x in ln.split()]
+            if len(b) >= 2:
+                return b[0] | (b[1] << 8), ""
+    return None, " | ".join(l.strip() for l in p.stderr.splitlines()[:2]) or "no output"
+
+
+def preflight(args):
+    """One read before the loop. An unreachable BMC, missing sudo, or an
+    unsupported OEM command should stop the run with the reason on screen, not
+    produce a CSV full of read_ok=0."""
+    probe = f"raw 0x3a 0x52 {BUS:#04x} {PSUS[1]:#04x} 0x02 {args.cmds[0]:#04x}"
+    w, err = _run_one(args, probe)
+    if w is not None:
+        return True
+    sys.stderr.write(
+        "psu_pmbus_poll: preflight read failed, not polling.\n"
+        f"  command: {' '.join(ipmi_prefix(args))} {probe}\n"
+        f"  error  : {err}\n\n"
+        "  Work down this ladder on the host to find the layer that breaks:\n"
+        "    sudo -n ipmitool mc info                       # local IPMI at all?\n"
+        "    sudo -n ipmitool sensor reading CUR_PSU1_IOUT   # BMC sensor path?\n"
+        "    sudo -n ipmitool raw 0x3a 0x52 0x0c 0xb0 0x02 0x97   # OEM bridge?\n"
+        "  If the third works but this script does not, re-run with --no-batch.\n")
+    return False
 
 
 def decode(words, psus, cmds):
@@ -159,8 +210,9 @@ def bmc_iout(args):
 
 def validate(args):
     print("Reading IOUT (0x8c) over PMBus for all four supplies...")
-    words = run_batch(args, build_batch([1, 2, 3, 4], [0x8c]))
+    words, err = run_batch(args, build_batch([1, 2, 3, 4], [0x8c]))
     if words is None:
+        print(f"  error: {err}")
         print("FAILED: batch did not return one hex line per command.")
         print("Try one command by hand to see the actual error:")
         print(f"  {' '.join(ipmi_prefix(args))} raw 0x3a 0x52 0x0c 0xb0 0x02 0x8c")
@@ -196,8 +248,9 @@ def validate(args):
 
     print("\nProbing READ_POUT (0x96) and READ_PIN (0x97). 0x97 is confirmed by")
     print("ASRock; 0x96 is the PMBus standard code but unconfirmed here:")
-    w = run_batch(args, build_batch([1, 2, 3, 4], [0x96, 0x97]))
+    w, err = run_batch(args, build_batch([1, 2, 3, 4], [0x96, 0x97]))
     if w is None:
+        print(f"  error: {err}")
         print("  batch failed -- 0x96 may be unsupported. Fall back to")
         print("  --cmds 0x97 0x8c and derive output power as IOUT * VOUT.")
         return 1
@@ -215,7 +268,7 @@ def validate(args):
 def poll(args):
     cmds, psus = args.cmds, sorted(PSUS)
     lines = build_batch(psus, cmds)
-    cols = ["timestamp", "interval_s", "read_ok"]
+    cols = ["timestamp", "interval_s", "read_ok", "err"]
     cols += [f"psu{p}_{PMBUS_READS[c][0]}" for p in psus for c in cmds]
     if 0x97 in cmds:
         cols.append("system_pin_w")
@@ -226,12 +279,12 @@ def poll(args):
     out.write(",".join(cols) + "\n")
 
     t_end = time.time() + args.duration if args.duration else None
-    prev = None
+    prev, last_err = None, None
     try:
         while t_end is None or time.time() < t_end:
             t0 = time.time()
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-            words = run_batch(args, lines)
+            words, err = run_batch(args, lines)
             # Record the ACHIEVED interval, not the requested one. The previous
             # PSU poller was nominally 0.25 s and actually landed near 1 Hz,
             # which was only discovered long afterwards. A trace that carries its
@@ -240,10 +293,14 @@ def poll(args):
             prev = t0
 
             if words is None:
-                row = [ts, interval, "0"] + [""] * (len(cols) - 3)
+                if err and err != last_err:
+                    sys.stderr.write(f"psu_pmbus_poll: {err}\n")
+                    last_err = err
+                row = [ts, interval, "0", err.replace(",", ";")]
+                row += [""] * (len(cols) - 4)
             else:
                 d = decode(words, psus, cmds)
-                row = [ts, interval, "1"]
+                row = [ts, interval, "1", ""]
                 row += [str(d[f"psu{p}_{PMBUS_READS[c][0]}"]) for p in psus for c in cmds]
                 if 0x97 in cmds:
                     row.append(f"{sum(d[f'psu{p}_pin_w'] for p in psus):.1f}")
@@ -291,8 +348,17 @@ def main():
     ap.add_argument("--password", default=os.environ.get("IPMI_PASSWORD", ""))
     ap.add_argument("--no-sudo", dest="sudo", action="store_false",
                     help="do not prefix local ipmitool with sudo -n")
+    ap.add_argument("--no-batch", action="store_true",
+                    help="one ipmitool per read instead of a batched exec. "
+                         "Much slower, but isolates which read fails.")
+    ap.add_argument("--force", action="store_true",
+                    help="poll even if the preflight read fails")
     args = ap.parse_args()
-    sys.exit(validate(args)) if args.validate else poll(args)
+    if args.validate:
+        sys.exit(validate(args))
+    if not preflight(args) and not args.force:
+        sys.exit(2)
+    poll(args)
 
 
 if __name__ == "__main__":
