@@ -54,6 +54,25 @@ and is strong evidence that 0x96 really is READ_POUT and that the LINEAR11 decod
 is right -- four independent supplies would not all land in the correct band by
 accident. PSU3 and PSU4, invisible to the BMC, read normally.
 
+SENSOR RATE (measured on cptroca25 at --interval 0.1). The transport sustains
+10 Hz at 100% success -- 80 raw IPMI reads/s -- but the readings do not. Values
+change on only 19-33% of polls, with runs of 3.0-5.2 identical samples, implying
+a sensor update period of 300-520 ms, i.e. ~2-3 Hz. Quantization is 1.0 W on PIN
+and 0.25 W on POUT. Note the measurement was taken at idle, where a constant load
+also produces repeats, so this BOUNDS the sensor at no faster than ~2-3 Hz rather
+than pinning it; separating staleness from constancy needs a varying load, where
+a slow sensor draws staircases whose tread length is the update period.
+
+The default 0.25 s is therefore the right operating point: at or above the
+sensor's real rate, and 10 Hz buys nothing but rows. There is also a reason not to
+push it -- the moment this data matters most is a fault, when the BMC is also
+logging SEL entries and handling the power event, and 80 transactions/s of extra
+housekeeping risks perturbing what you are trying to capture.
+
+This is an envelope instrument. It cannot speak to the microsecond current edges
+that hypotheses 9 and 12 concern; it answers whether system power did something
+sustained and unusual.
+
 Still worth running --validate once per platform: the efficiency check confirms
 the command codes and the decode, but only the BMC cross-check confirms the
 ADDRESS MAP, i.e. that 0xb0 is the supply the BMC calls PSU1.
