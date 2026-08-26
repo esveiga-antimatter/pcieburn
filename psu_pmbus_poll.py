@@ -278,6 +278,25 @@ def bmc_iout(args):
 
 
 def validate(args):
+    # The PMBus read and the BMC sensor read are separate IPMI transactions
+    # hundreds of ms apart. Under an oscillating load -- pcieburn swings kilowatts
+    # at a few Hz -- they straddle the transition and the delta becomes noise that
+    # flips sign between runs. An earlier version reported "decode or address map
+    # is wrong" on exactly that, which was a false alarm from an invalid test.
+    # So: check whether the load is moving before comparing anything.
+    a, _ = _run_one(args, f"raw 0x3a 0x52 {BUS:#04x} {PSUS[1]:#04x} 0x02 0x8c")
+    time.sleep(0.4)
+    b, _ = _run_one(args, f"raw 0x3a 0x52 {BUS:#04x} {PSUS[1]:#04x} 0x02 0x8c")
+    if a is not None and b is not None:
+        x, y = linear11(a), linear11(b)
+        if max(x, y) > 0 and abs(x - y) / max(x, y) > 0.10:
+            print(f"!! LOAD IS MOVING: PSU1 IOUT read {x:.2f} A then {y:.2f} A "
+                  f"0.4 s apart ({100*abs(x-y)/max(x,y):.0f}% apart).\n"
+                  "!! This comparison is INVALID while the load oscillates -- the two\n"
+                  "!! readings are separate IPMI transactions and will straddle the\n"
+                  "!! swing, producing large deltas of either sign that say nothing\n"
+                  "!! about the decode. Stop the load and re-run at idle.\n")
+            return 3
     print("Reading IOUT (0x8c) over PMBus for all four supplies...")
     words, err = run_batch(args, build_batch([1, 2, 3, 4], [0x8c]))
     if words is None:
@@ -311,9 +330,11 @@ def validate(args):
         print("      bridge, address map, endianness and LINEAR11 decode are all")
         print("      correct. PSU3/PSU4 readings can be trusted.")
     else:
-        print("FAIL: do not trust PSU3/PSU4. A mismatch on a supply the BMC can")
-        print("      see means the decode or address map is wrong, and the")
-        print("      invisible supplies have no second opinion to catch it.")
+        print("FAIL: PMBus and the BMC disagree on a supply both can see. If the")
+        print("      load was genuinely idle, the decode or address map is wrong and")
+        print("      PSU3/PSU4 have no second opinion to catch it. If anything was")
+        print("      running, re-run at idle first -- non-simultaneous reads across a")
+        print("      moving load produce exactly this, with no fault in the decode.")
 
     print("\nProbing READ_POUT (0x96) and READ_PIN (0x97). 0x97 is confirmed by")
     print("ASRock; 0x96 is the PMBus standard code but unconfirmed here:")
