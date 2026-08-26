@@ -207,6 +207,47 @@ def preflight(args):
     return False
 
 
+def scan(args):
+    """Probe the PMBus address range for supplies we are not polling.
+
+    This exists because a cross-check against NVML showed the four named
+    supplies reporting LESS output than the GPUs alone consume under load: the
+    POUT-vs-GPU slope is 0.92 below 1 kW of GPU draw but only 0.27 above 2.5 kW,
+    i.e. the four carry nearly everything at idle and about a quarter of the
+    marginal load at power. That is the signature of further supplies coming
+    online as load rises -- and a system total summed over four of them is then
+    badly wrong in exactly the regime that matters.
+
+    Read-only: one READ_PIN per address, which is the same command ASRock
+    supplied.
+    """
+    print("Probing 8-bit PMBus addresses 0xb0..0xbe (7-bit 0x58..0x5f) "
+          "with READ_PIN (0x97).")
+    print("Known: 0xb0=PSU1 0xb2=PSU2 0xb4=PSU3 0xb6=PSU4\n")
+    found = []
+    for addr in range(0xb0, 0xc0, 2):
+        w, err = _run_one(args, f"raw 0x3a 0x52 {BUS:#04x} {addr:#04x} 0x02 0x97")
+        known = {0xb0: "PSU1", 0xb2: "PSU2", 0xb4: "PSU3", 0xb6: "PSU4"}.get(addr, "")
+        if w is None:
+            print(f"  {addr:#04x} {known:<5} no response   ({err[:60]})")
+        else:
+            v = linear11(w)
+            print(f"  {addr:#04x} {known:<5} READ_PIN = {v:8.1f} W"
+                  + ("   <-- NOT IN THE POLL LIST" if not known else ""))
+            found.append((addr, v))
+    extra = [a for a, _ in found if a not in (0xb0, 0xb2, 0xb4, 0xb6)]
+    print()
+    if extra:
+        print(f"Found {len(extra)} supply(ies) beyond the four named: "
+              + " ".join(hex(a) for a in extra))
+        print("Add them to PSUS and re-take any capture whose system totals matter.")
+    else:
+        print("No supplies beyond the four named respond. If system POUT still")
+        print("falls short of NVML under load, the shortfall is NOT a missing")
+        print("address and the next suspect is the POUT register itself.")
+    return 0
+
+
 def decode(words, psus, cmds):
     out, i = {}, 0
     for psu in psus:
@@ -359,6 +400,9 @@ def hexint(s):
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scan", action="store_true",
+                    help="probe the PMBus address range for supplies beyond the "
+                         "four ASRock named, and exit. Read-only.")
     ap.add_argument("--validate", action="store_true",
                     help="cross-check against the BMC's PSU1/PSU2 sensors and "
                          "exit. Run this before trusting any output.")
@@ -382,6 +426,8 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="poll even if the preflight read fails")
     args = ap.parse_args()
+    if args.scan:
+        sys.exit(scan(args))
     if args.validate:
         sys.exit(validate(args))
     if not preflight(args) and not args.force:
