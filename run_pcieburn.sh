@@ -62,7 +62,14 @@ Wrapper options:
                       range: PWR_*_PIN wraps at 255 W and PWR_*_POUT saturates
                       near 510 W, so both (and DCMI, which derives from PIN)
                       read garbage above idle. Current does not.
-  --psu-interval SEC  PSU current poll interval (default 0.25)
+  --with-psu-pmbus    poll per-PSU INPUT and OUTPUT POWER for all four supplies
+                      over the ASRock PMBus bridge, via psu_pmbus_poll.py. The
+                      BMC surfaces sensors for only two of the four, so
+                      --with-psu can measure half the chassis and must estimate
+                      the rest; this reads all four directly. Confirmed on
+                      hardware: 4 Hz steady, 100% read success, per-supply
+                      efficiency ~95%. Read-only PMBus commands throughout.
+  --psu-interval SEC  PSU current poll interval, both pollers (default 0.25)
   --active-supplies N assumed number of load-sharing PSUs, used only for the
                       estimated system power column (default 4, from measured
                       4-way sharing on a 4+1 1600W CRPS chassis)
@@ -109,6 +116,7 @@ while [[ $# -gt 0 ]]; do
         --with-aer)      WITH_AER=1; shift ;;
         --aer-interval)  AER_INTERVAL="$2"; shift 2 ;;
         --with-psu)      WITH_PSU=1; shift ;;
+        --with-psu-pmbus) WITH_PSU_PMBUS=1; shift ;;
         --psu-interval)  PSU_INTERVAL="$2"; shift 2 ;;
         --active-supplies) ACTIVE_SUPPLIES="$2"; shift 2 ;;
         --psu-rating)    PSU_RATING_W="$2"; shift 2 ;;
@@ -143,6 +151,7 @@ AERDELTA="$RUNDIR/aer_delta.txt"
 AER_UNCORR="$RUNDIR/aer_uncorrectable.csv"
 AER_BASE="$RUNDIR/aer_baseline.txt"
 PSUCSV="$RUNDIR/psu_current.csv"
+PMBUSCSV="$RUNDIR/psu_pmbus.csv"
 PSUSUM="$RUNDIR/psu_summary.txt"
 
 # --- safety gate ----------------------------------------------------------
@@ -198,7 +207,7 @@ say "uptime at start: $UPTIME_H (booted $BOOT_UTC)"
     # idle exceeded the 20 s dwell limit on EVERY switch-node run — four uniform
     # all-8-GPU false DEGRADED verdicts before it was caught. Uniform dwell on
     # all GPUs is the signature of that artifact; real degradation is per-link.
-    echo "wrapper_version   : 3"
+    echo "wrapper_version   : 4"
     echo "settle_seconds    : $SETTLE_SECONDS"
     echo "uptime_seconds    : $UPTIME_S"
     echo "uptime_human      : $UPTIME_H"
@@ -540,6 +549,34 @@ if [[ $WITH_PSU -eq 1 ]]; then
     fi
 fi
 
+# --- PMBus: all four supplies, input and output power -------------------------
+# The BMC exposes sensors for only two of the four supplies, so --with-psu
+# measures half the chassis and extrapolates the rest. The ASRock PMBus bridge
+# reaches all four directly. See psu_pmbus_poll.py for the register map, the
+# LINEAR11 decode, and the read-only command allowlist.
+#
+# Aggregate the resulting CSV with MEDIANS, not means: the four reads in a round
+# are ~30 ms apart and the file sums them, so one stale-low reading drags the sum
+# down while lifting it needs all four high. On a measured steady-load run, 44%
+# of summed samples fell below the concurrent GPU-only draw and the mean sat
+# 478 W below the median. Idle is unaffected.
+PMBUS_PID=""
+if [[ ${WITH_PSU_PMBUS:-0} -eq 1 ]]; then
+    if [[ ! -x "$HERE/psu_pmbus_poll.py" ]]; then
+        say "WARNING: $HERE/psu_pmbus_poll.py not found or not executable;"
+        say "         skipping PMBus capture"
+    elif ! sudo -n ipmitool raw 0x3a 0x52 0x0c 0xb0 0x02 0x97 >/dev/null 2>&1; then
+        say "WARNING: PMBus bridge read failed (needs sudo and the OEM command"
+        say "         0x3a 0x52 on this platform); skipping PMBus capture."
+        say "         Diagnose with: sudo $HERE/psu_pmbus_poll.py --scan"
+    else
+        say "polling all 4 PSUs over PMBus every ${PSU_INTERVAL}s -> $PMBUSCSV"
+        "$HERE/psu_pmbus_poll.py" --out "$PMBUSCSV" \
+            --interval "$PSU_INTERVAL" >/dev/null 2>"$RUNDIR/psu_pmbus.err" &
+        PMBUS_PID=$!
+    fi
+fi
+
 DMON_PID=""
 if [[ $WITH_DMON -eq 1 ]]; then
     say "starting PCIe throughput trace (dmon) -> $DMON"
@@ -558,6 +595,7 @@ TAIL_PID=""
 : "${DMON_PID:=}"
 : "${NVML_PID:=}"
 : "${PSU_PID:=}"
+: "${PMBUS_PID:=}"
 cleanup() {
     local rc=$?
     trap - EXIT INT TERM
@@ -599,6 +637,12 @@ cleanup() {
         wait "$AER_PID" 2>/dev/null
     fi
 
+    if [[ -n "${PMBUS_PID:-}" ]] && kill -0 "$PMBUS_PID" 2>/dev/null; then
+        say "stopping PMBus poll"
+        kill -TERM "$PMBUS_PID" 2>/dev/null
+        wait "$PMBUS_PID" 2>/dev/null
+        PMBUS_PID=""
+    fi
     if [[ -n "$PSU_PID" ]] && kill -0 "$PSU_PID" 2>/dev/null; then
         say "stopping PSU current poll"
         kill -TERM "$PSU_PID" 2>/dev/null
@@ -969,6 +1013,50 @@ if [[ $POST_FATAL -eq 1 && $RC -eq 0 ]]; then
     say "      was lost during the ${SETTLE_SECONDS}s settle window:"
     say "      $POST_FATAL_WHAT"
     say "      Without --settle this run would have been recorded as clean."
+fi
+if [[ -s "$PMBUSCSV" ]]; then
+    say "  psu_pmbus.csv  all 4 PSUs, input and output power:"
+    awk -F',' '
+        NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+        $col["read_ok"] != 1 { bad++; next }
+        { n++
+          sp[n] = $col["system_pout_w"] + 0
+          si[n] = $col["system_pin_w"]  + 0
+          for (p = 1; p <= 4; p++) po[p][n] = $col["psu" p "_pout_w"] + 0
+          if (n == 1 || sp[n] < lo) lo = sp[n]
+          if (n == 1 || sp[n] > hi) hi = sp[n] }
+        END {
+            if (n == 0) { printf "      no successful reads (see psu_pmbus.err)\n"; exit }
+            # Split idle from load at the midpoint of the observed range and take a
+            # median WITHIN each regime; a whole-file median would depend on how
+            # much idle padding the capture happens to contain. A flat trace has
+            # no split to make.
+            flat = (hi <= 0 || (hi - lo) / hi < 0.20)
+            thr = lo + 0.5 * (hi - lo)
+            for (i = 1; i <= n; i++) {
+                if (flat || sp[i] >= thr) {
+                    L[++nl] = sp[i]; LI[nl] = si[i]
+                    for (p = 1; p <= 4; p++) LP[p][nl] = po[p][i]
+                } else I[++ni] = sp[i]
+            }
+            if (!flat && ni > 0) {
+                asort(I)
+                printf "      idle   median out %7.1f W  (n=%d)\n", I[int(ni/2)+1], ni
+            }
+            if (nl > 0) {
+                asort(L); asort(LI)
+                for (p = 1; p <= 4; p++) {
+                    asort(LP[p]); s = s sprintf(" %.0f", LP[p][int(nl/2)+1])
+                }
+                printf "      %s median out %7.1f W  in %7.1f W  (n=%d)\n",
+                       (flat ? "steady" : "loaded"), L[int(nl/2)+1], LI[int(nl/2)+1], nl
+                printf "      %s per-PSU out:%s W\n", (flat ? "steady" : "loaded"), s
+            }
+            printf "      %d reads", n
+            if (bad > 0) printf ", %d FAILED", bad
+            printf ". Aggregate with medians: instantaneous 4-PSU sums\n"
+            printf "      are unreliable under load (one stale read drags a sum down).\n"
+        }' "$PMBUSCSV" 2>/dev/null | while IFS= read -r l; do say "$l"; done
 fi
 if [[ -s "$RUNDIR/faults.txt" ]]; then
     say "  faults.txt     *** kernel reported PCIe/Xid activity — read this ***"
