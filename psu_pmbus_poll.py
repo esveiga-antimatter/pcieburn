@@ -39,6 +39,34 @@ the BMC *can* see and compares against the BMC's own sensors. If those agree, th
 bridge, address map, endianness and decode are all correct at once -- after which
 the identical decode can be trusted for PSU3/PSU4, which have no second opinion.
 
+ANALYSIS: USE MEDIANS, NOT MEANS, UNDER LOAD
+-------------------------------------------
+Measured on cptroca25 against a paired NVML trace. At idle the instrument is
+tight: per-sample efficiency median 89.7%, p5 88.2%, p95 94.0%, max 95.3%, and
+system POUT reconciles with NVML to within 30 W across separate idle periods.
+
+Under load it is not. The four PSU reads in a round are ~30 ms apart and
+system_pout_w sums them, so a single stale-low reading drags the whole sum down
+while it takes all four running high to lift it. The result is a one-sided low
+tail: on a 183 s steady-load run, 288 of 658 summed samples (44%) came out BELOW
+the concurrent GPU-only draw, which is impossible, and the mean sat 478 W below
+the median.
+
+So aggregate over a window with a MEDIAN. On that run the mean gave a
+rest-of-system of -275 W (impossible) and the median gave +203 W. Per-sample
+efficiency under load reaches 285%, which is likewise a pairing artifact and not
+a calibration fault -- POUT and PIN within a round are not simultaneous either.
+
+Note this is NOT the pass-level workload oscillation: the same behaviour appears
+with the 93.6%-duty 8192 arm as with the 54%-duty default, so it is read-level
+staleness rather than aliasing against the GEMM/collective cycle.
+
+Residual after using medians is consistent with NVML over-reporting GPU board
+power by roughly 8%, which reconciles idle and load together. Treat that as a
+working estimate, not a measurement -- it rests on rest-of-system being roughly
+constant, and settling it properly needs a metered PDU or a clamp on the 12 V
+cables.
+
 SAFETY
 ------
 Only ever issue PMBus *read* codes through this bridge. The same OEM command can
