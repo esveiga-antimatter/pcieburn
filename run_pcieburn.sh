@@ -9,8 +9,14 @@
 #
 # Usage:
 #   ./run_pcieburn.sh --duration 90
-#   ./run_pcieburn.sh --with-nvml --duration 300 -- --gemms-per-coll 16
+#   ./run_pcieburn.sh --duration 300 -- --gemms-per-coll 16
 #   ./run_pcieburn.sh --outdir /data/runs --tag gen5-retest -- --collective alltoall
+#
+# Every telemetry collector is ON by default: an artifact bundle should be
+# complete without the operator having to remember a flag for each channel.
+# Turn one off with its --no-* flag (--no-dmon, --no-psu, ...) when a platform
+# cannot support it. Each collector also self-disables with a warning when its
+# data source is unavailable, and the manifest records which ones actually ran.
 #
 # Anything after `--` is passed straight through to the pcieburn binary.
 
@@ -21,11 +27,16 @@ BIN="${PCIEBURN_BIN:-$HERE/pcieburn}"
 
 OUTDIR_BASE="$HERE/runs"
 TAG=""
-WITH_NVML=0
-WITH_DMON=0
-WITH_AER=0
+# Telemetry defaults to ON. Every one of these was previously opt-in, which meant
+# the completeness of a run bundle depended on the operator remembering five
+# flags — and a bundle missing a channel could not be distinguished from a run
+# where that channel had nothing to report. Opt out per channel with --no-*.
+WITH_NVML=1
+WITH_DMON=1
+WITH_AER=1
 AER_INTERVAL=1
-WITH_PSU=0
+WITH_PSU=1
+WITH_PSU_PMBUS=1
 PSU_INTERVAL=0.25
 ACTIVE_SUPPLIES=4
 PSU_RATING_W=1600
@@ -46,36 +57,11 @@ Wrapper options:
   --outdir DIR        parent directory for run dirs (default ./runs)
   --tag NAME          label for this run, used in the dir name and event log
   --duration SEC      forwarded to pcieburn, and used to size the NVML trace
-  --with-nvml         also capture a per-GPU nvidia-smi trace for this run
-                      (power, clocks, temp, util, and PCIe link gen/width)
-  --with-dmon         also capture nvidia-smi dmon PCIe rx/tx throughput.
-                      Independent of pcieburn's own byte accounting, so it
-                      cross-checks it. May report '-' on GeForce parts.
-  --with-aer          poll per-GPU and per-root-port AER correctable error
-                      counters from sysfs. This is the graded measurement: link
-                      errors accumulate before anything fatal happens, so you
-                      can rank configurations without having to reach a fault
-                      and reboot. Strongly recommended.
-  --aer-interval SEC  AER poll interval (default 1)
-  --with-psu          poll per-PSU output CURRENT via IPMI. On this platform
-                      CUR_PSU*_IOUT is the only power sensor with adequate
-                      range: PWR_*_PIN wraps at 255 W and PWR_*_POUT saturates
-                      near 510 W, so both (and DCMI, which derives from PIN)
-                      read garbage above idle. Current does not.
-  --with-psu-pmbus    poll per-PSU INPUT and OUTPUT POWER for all four supplies
-                      over the ASRock PMBus bridge, via psu_pmbus_poll.py. The
-                      BMC surfaces sensors for only two of the four, so
-                      --with-psu can measure half the chassis and must estimate
-                      the rest; this reads all four directly. Confirmed on
-                      hardware: 4 Hz steady, 100% read success, per-supply
-                      efficiency ~95%. Read-only PMBus commands throughout.
-  --psu-interval SEC  PSU current poll interval, both pollers (default 0.25)
   --active-supplies N assumed number of load-sharing PSUs, used only for the
                       estimated system power column (default 4, from measured
                       4-way sharing on a 4+1 1600W CRPS chassis)
   --psu-rating W      per-supply rating, for the %-of-rating column (default
                       1600, matching this chassis's CRPS units)
-  --nvml-interval MS  NVML sample interval (default 100)
   --settle SEC        keep every collector running and delay the post-run kernel
                       log snapshot by SEC seconds (default 30, 0 disables).
                       This exists because a containment event can land AFTER the
@@ -86,6 +72,45 @@ Wrapper options:
                       only recovered from the NEXT run's dmesg_before.
   --yes               skip the interactive safety confirmation
   -h, --help          this message
+
+Telemetry: every collector below is ON by default, so a bundle is complete
+without having to remember a flag for each channel. Each one also self-disables
+with a warning if its data source is missing, and the manifest's "telemetry
+collectors" section records which ones actually ran -- so an absent CSV is never
+ambiguous between "not asked for" and "nothing to report".
+
+  --no-nvml           skip the per-GPU nvidia-smi trace (power, clocks, temp,
+                      util, and PCIe link gen/width). Note the degraded-link
+                      verdict (exit 5) is computed from this trace, so a run
+                      without it cannot be checked for silent downtraining.
+  --nvml-interval MS  NVML sample interval (default 100)
+  --no-dmon           skip the nvidia-smi dmon PCIe rx/tx throughput trace. It
+                      is independent of pcieburn's own byte accounting, so it
+                      cross-checks it. Reports '-' on some GeForce parts, in
+                      which case the file is simply empty of numbers.
+  --no-aer            skip the per-GPU and per-root-port AER error counters from
+                      sysfs. Strongly discouraged: this is the only graded
+                      measurement in the set. Link errors accumulate before
+                      anything fatal happens, so it ranks configurations, and
+                      the eight links against each other, without having to
+                      reach a fault and reboot the node each time.
+  --aer-interval SEC  AER poll interval (default 1)
+  --no-psu            skip BOTH PSU channels, the BMC sensors and PMBus.
+  --no-psu-bmc        skip the BMC current sensors, keep PMBus. Of the BMC's
+                      channels only CUR_PSU*_IOUT has adequate range: PWR_*_PIN
+                      wraps at 255 W, PWR_*_POUT saturates near 510 W, and DCMI
+                      derives from PIN, so all three read garbage above idle.
+  --no-psu-pmbus      skip PMBus, keep the BMC sensors. The two are
+                      complementary: PMBus reads per-PSU input and output power
+                      for all four supplies over the ASRock bridge via
+                      psu_pmbus_poll.py (read-only commands, 4 Hz, confirmed on
+                      hardware), while the BMC sees only two supplies and is the
+                      only independent cross-check on those. Aggregate the PMBus
+                      CSV with medians; the summary at the end does this for you.
+  --no-telemetry      skip every collector above: load only, no measurement.
+  --with-nvml, --with-dmon, --with-aer, --with-psu, --with-psu-pmbus
+                      accepted and ignored -- these are on by default now. Kept
+                      so existing command lines and runbook entries still work.
 
 Everything after `--` goes to pcieburn verbatim. See ./pcieburn --help.
 
@@ -111,12 +136,20 @@ while [[ $# -gt 0 ]]; do
         --outdir)        OUTDIR_BASE="$2"; shift 2 ;;
         --tag)           TAG="$2"; shift 2 ;;
         --duration)      DURATION="$2"; shift 2 ;;
-        --with-nvml)     WITH_NVML=1; shift ;;
-        --with-dmon)     WITH_DMON=1; shift ;;
-        --with-aer)      WITH_AER=1; shift ;;
+        # Accepted and ignored: these collectors are on by default now. Kept so
+        # older command lines and runbook entries keep working rather than
+        # aborting on an unknown option.
+        --with-nvml|--with-dmon|--with-aer|--with-psu|--with-psu-pmbus)
+                         shift ;;
+        --no-nvml)       WITH_NVML=0; shift ;;
+        --no-dmon)       WITH_DMON=0; shift ;;
+        --no-aer)        WITH_AER=0; shift ;;
         --aer-interval)  AER_INTERVAL="$2"; shift 2 ;;
-        --with-psu)      WITH_PSU=1; shift ;;
-        --with-psu-pmbus) WITH_PSU_PMBUS=1; shift ;;
+        --no-psu)        WITH_PSU=0; WITH_PSU_PMBUS=0; shift ;;
+        --no-psu-bmc)    WITH_PSU=0; shift ;;
+        --no-psu-pmbus)  WITH_PSU_PMBUS=0; shift ;;
+        --no-telemetry)  WITH_NVML=0; WITH_DMON=0; WITH_AER=0
+                         WITH_PSU=0; WITH_PSU_PMBUS=0; shift ;;
         --psu-interval)  PSU_INTERVAL="$2"; shift 2 ;;
         --active-supplies) ACTIVE_SUPPLIES="$2"; shift 2 ;;
         --psu-rating)    PSU_RATING_W="$2"; shift 2 ;;
@@ -207,7 +240,12 @@ say "uptime at start: $UPTIME_H (booted $BOOT_UTC)"
     # idle exceeded the 20 s dwell limit on EVERY switch-node run — four uniform
     # all-8-GPU false DEGRADED verdicts before it was caught. Uniform dwell on
     # all GPUs is the signature of that artifact; real degradation is per-link.
-    echo "wrapper_version   : 4"
+    # v5: every telemetry collector is on by default, where each previously
+    # needed its own --with-* flag. In a v4 bundle a missing nvml_trace.csv or
+    # aer_delta.txt may just mean nobody asked for it; in a v5 bundle that
+    # channel was either disabled with --no-* or self-disabled for want of a
+    # data source, and the "telemetry collectors" section records which.
+    echo "wrapper_version   : 5"
     echo "settle_seconds    : $SETTLE_SECONDS"
     echo "uptime_seconds    : $UPTIME_S"
     echo "uptime_human      : $UPTIME_H"
@@ -348,7 +386,19 @@ DMESG_BEFORE_LINES=$(wc -l < "$RUNDIR/dmesg_before.txt")
         "$(grep -c 'Hardware Error' "$RUNDIR/dmesg_before.txt" 2>/dev/null || echo 0)"
 } >> "$MANIFEST"
 
-# --- optional NVML trace --------------------------------------------------
+# --- NVML trace (on by default) -------------------------------------------
+# Every collector from here down is enabled unless explicitly turned off, so each
+# has to fail soft: a missing data source disables that one collector, says so,
+# and is recorded in the manifest -- it never aborts the run, because the load
+# phase is the part that costs a reboot to repeat.
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    if [[ $WITH_NVML -eq 1 || $WITH_DMON -eq 1 ]]; then
+        say "WARNING: nvidia-smi not on PATH; skipping the NVML and dmon traces"
+    fi
+    WITH_NVML=0
+    WITH_DMON=0
+fi
+
 NVML_PID=""
 if [[ $WITH_NVML -eq 1 ]]; then
     say "starting NVML trace at ${NVML_INTERVAL_MS}ms -> $NVML"
@@ -550,9 +600,9 @@ if [[ $WITH_PSU -eq 1 ]]; then
 fi
 
 # --- PMBus: all four supplies, input and output power -------------------------
-# The BMC exposes sensors for only two of the four supplies, so --with-psu
-# measures half the chassis and extrapolates the rest. The ASRock PMBus bridge
-# reaches all four directly. See psu_pmbus_poll.py for the register map, the
+# The BMC exposes sensors for only two of the four supplies, so the BMC channel
+# alone measures half the chassis and extrapolates the rest. The ASRock PMBus
+# bridge reaches all four directly. See psu_pmbus_poll.py for the register map, the
 # LINEAR11 decode, and the read-only command allowlist.
 #
 # Aggregate the resulting CSV with MEDIANS, not means: the four reads in a round
@@ -561,14 +611,16 @@ fi
 # of summed samples fell below the concurrent GPU-only draw and the mean sat
 # 478 W below the median. Idle is unaffected.
 PMBUS_PID=""
-if [[ ${WITH_PSU_PMBUS:-0} -eq 1 ]]; then
+if [[ $WITH_PSU_PMBUS -eq 1 ]]; then
     if [[ ! -x "$HERE/psu_pmbus_poll.py" ]]; then
         say "WARNING: $HERE/psu_pmbus_poll.py not found or not executable;"
         say "         skipping PMBus capture"
+        WITH_PSU_PMBUS=0
     elif ! sudo -n ipmitool raw 0x3a 0x52 0x0c 0xb0 0x02 0x97 >/dev/null 2>&1; then
         say "WARNING: PMBus bridge read failed (needs sudo and the OEM command"
         say "         0x3a 0x52 on this platform); skipping PMBus capture."
         say "         Diagnose with: sudo $HERE/psu_pmbus_poll.py --scan"
+        WITH_PSU_PMBUS=0
     else
         say "polling all 4 PSUs over PMBus every ${PSU_INTERVAL}s -> $PMBUSCSV"
         "$HERE/psu_pmbus_poll.py" --out "$PMBUSCSV" \
@@ -587,6 +639,22 @@ if [[ $WITH_DMON -eq 1 ]]; then
     nvidia-smi dmon -s t -d 1 -o DT > "$DMON" 2>"$RUNDIR/pcie_dmon.err" &
     DMON_PID=$!
 fi
+
+# Which collectors are actually running, written after each has had its chance to
+# self-disable. This is the record that keeps an absent CSV unambiguous: with
+# telemetry on by default, "no aer_delta.txt" means the counters were unreachable
+# or explicitly waived, not that nobody asked -- a materially different claim
+# about the run when the bundle is read back weeks later.
+on_off() { [[ "$1" -eq 1 ]] && echo "on${2:+  $2}" || echo "off"; }
+{
+    echo
+    echo "--- telemetry collectors (on by default; --no-* to waive) ---"
+    printf 'nvml              : %s\n' "$(on_off "$WITH_NVML" "${NVML_INTERVAL_MS}ms")"
+    printf 'dmon              : %s\n' "$(on_off "$WITH_DMON" "1s")"
+    printf 'aer               : %s\n' "$(on_off "$WITH_AER" "${AER_INTERVAL}s")"
+    printf 'psu_bmc           : %s\n' "$(on_off "$WITH_PSU" "${PSU_INTERVAL}s")"
+    printf 'psu_pmbus         : %s\n' "$(on_off "$WITH_PSU_PMBUS" "${PSU_INTERVAL}s")"
+} >> "$MANIFEST"
 
 # --- cleanup: never leave orphans behind ---------------------------------
 BURN_PID=""
@@ -956,7 +1024,22 @@ say "  manifest.txt   run provenance, BIOS/topology snapshot, verdict"
 say "  pcieburn.log   timestamped console output"
 say "  events.csv     per-rank event log for telemetry correlation"
 [[ $WITH_NVML -eq 1 ]] && say "  nvml_trace.csv per-GPU NVML trace incl. PCIe link gen/width"
-[[ $WITH_DMON -eq 1 ]] && say "  pcie_dmon.txt  PCIe rx/tx throughput (independent cross-check)"
+if [[ $WITH_DMON -eq 1 ]]; then
+    # dmon reports '-' instead of a rate on parts that do not expose the PCIe
+    # throughput counters. That is not a failure, but the file is then empty of
+    # numbers, and saying so beats listing it as if it held data.
+    # Columns are date, time, gpu, rxpci, txpci (from -s t -o DT above), so the
+    # two throughput fields are $4 and $5. Testing the whole line instead would
+    # always pass: the date and GPU index are digits even on an all-'-' row.
+    if awk '$0 ~ /^#/ { next }
+            $4 ~ /^[0-9]+$/ || $5 ~ /^[0-9]+$/ { n++ }
+            END { exit !(n > 0) }' "$DMON" 2>/dev/null; then
+        say "  pcie_dmon.txt  PCIe rx/tx throughput (independent cross-check)"
+    else
+        say "  pcie_dmon.txt  (no throughput reported — these counters are not"
+        say "                 exposed on this part; not a failure)"
+    fi
+fi
 if [[ -s "$PSUSUM" ]]; then
     say "  psu_current.csv / psu_summary.txt  per-PSU output current:"
     while IFS= read -r l; do [[ -n "$l" ]] && say "      $l"; done < "$PSUSUM"

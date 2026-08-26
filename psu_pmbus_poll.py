@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """Per-PSU input/output power over the ASRock PMBus bridge.
 
-WHY THIS EXISTS
----------------
-The BMC exposes sensors for only two of the four supplies (CUR_PSU1_IOUT,
-CUR_PSU2_IOUT). Everything downstream has therefore had to *estimate* system
-power by assuming the instrumented pair is representative and that load is shared
-evenly -- run_pcieburn.sh labels the column `est_system_w` for exactly that
-reason. Reading all four supplies directly over PMBus replaces that estimate with
-a measurement, and incidentally tests the even-sharing assumption itself.
-
 THE COMMAND
 -----------
     ipmitool raw 0x3a 0x52 0x0c <addr> 0x02 <pmbus_cmd>
@@ -486,3 +477,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

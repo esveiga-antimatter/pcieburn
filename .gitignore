@@ -17,3 +17,4 @@
 
 # Scratch PR description, regenerable from the commit messages.
 /PR_BODY.md
+.claude/
