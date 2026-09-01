@@ -44,6 +44,8 @@ NVML_INTERVAL_MS=100
 SETTLE_SECONDS=30
 DURATION=""
 ASSUME_YES=0
+RELAX_PCIE_ERRORS=0
+declare -a PCIE_POLICY_UNDO=()
 PASSTHRU=()
 
 ts_iso() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
@@ -70,6 +72,17 @@ Wrapper options:
                       load stopped and 5 s after the snapshot was taken. The
                       fault was invisible in that run's own artifacts and was
                       only recovered from the NEXT run's dmesg_before.
+  --relax-pcie-errors before the CUDA section, rewrite PCIe error policy on
+                      every port and endpoint in each GPU's path:
+                        * DPC trigger OFF on downstream-facing ports, so an
+                          ERR_FATAL is decoded by AER instead of being contained
+                          before the causing bit can be read;
+                        * Completion Timeout and Unexpected Completion demoted
+                          from fatal to non-fatal in the severity register,
+                          which is what the PCIe base spec specifies for both.
+                      Originals are recorded in the manifest and restored on a
+                      clean exit. OFF BY DEFAULT: it removes containment, so a
+                      fault takes the host down harder than it otherwise would.
   --yes               skip the interactive safety confirmation
   -h, --help          this message
 
@@ -155,6 +168,7 @@ while [[ $# -gt 0 ]]; do
         --psu-rating)    PSU_RATING_W="$2"; shift 2 ;;
         --nvml-interval) NVML_INTERVAL_MS="$2"; shift 2 ;;
         --settle)        SETTLE_SECONDS="$2"; shift 2 ;;
+        --relax-pcie-errors) RELAX_PCIE_ERRORS=1; shift ;;
         --yes|-y)        ASSUME_YES=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         --)              shift; PASSTHRU=("$@"); break ;;
@@ -728,6 +742,139 @@ ARGS=(--event-log "$EVENTS")
 # not an empty string (pcieburn would reject '' as an unknown option).
 ARGS+=(${PASSTHRU[@]+"${PASSTHRU[@]}"})
 
+
+# --- PCIe error policy ------------------------------------------------------
+# Applied to every port and endpoint in each GPU's PCIe path, immediately before
+# the CUDA section, and only under --relax-pcie-errors.
+#
+# Why DPC off: DPC contains the link within microseconds of an ERR_FATAL, which
+# is why every fault in this investigation logs "ERR_FATAL received from <dev>"
+# and never the uncorrectable bit that caused it. That bit lives in the
+# ENDPOINT's own AER capability, and the endpoint is unreachable once contained
+# — aer_uncorrectable.csv has been header-only in every bundle for exactly this
+# reason. Disarming DPC lets the kernel's AER handler read and decode it first.
+# It only helps where the device signalled while the link was still up; a
+# Surprise Down has already taken the link away and stays undecodable.
+#
+# Why the severity edit: the PCIe base spec leaves Completion Timeout (bit 14)
+# and Unexpected Completion (bit 16) NON-fatal. A platform that marks them fatal
+# turns a recoverable transaction error into a link-killing event. Only those
+# two bits are touched, read-modify-write, so every other platform-specific
+# severity choice survives untouched.
+#
+# Capability offsets are resolved symbolically (ECAP_DPC 0x001d, ECAP_AER
+# 0x0001) because they differ per device — cor04's root ports put DPC at 0x380,
+# another board will not.
+#
+# Register map used here:
+#   ECAP_DPC + 0x06 (16-bit)  DPC Control        bits 1:0 = Trigger Enable
+#   ECAP_AER + 0x0c (32-bit)  Uncorrectable Error Severity   set bit = fatal
+PCIE_SEV_DEMOTE=0x14000        # bit 14 CmpltTO, bit 16 UnxCmplt
+
+# Read one register; empty return means absent, unreadable, or all-ones.
+# setpci needs root even to read extended config space (offset >= 0x100).
+pcie_reg_read() {
+    local v
+    v=$(sudo -n setpci -s "$1" "$2" 2>/dev/null) || return 1
+    [[ -n "$v" && "$v" != "ffff" && "$v" != "ffffffff" ]] || return 1
+    printf '%s' "$v"
+}
+
+pcie_reg_write_verify() {      # bdf regspec newvalue -> 0 ok, 1 failed
+    sudo -n setpci -s "$1" "$2=$3" 2>/dev/null || return 1
+    local back
+    back=$(pcie_reg_read "$1" "$2") || return 1
+    [[ "$back" == "$3" ]]
+}
+
+apply_pcie_error_policy() {
+    local idx bdf role cur new dpc_note sev_note
+    local changed=0 readable=0
+
+    {
+        echo
+        echo "--- PCIe error policy (--relax-pcie-errors) ---"
+        echo "    DPC trigger disarmed on downstream ports; CmpltTO + UnxCmplt"
+        echo "    demoted to non-fatal. Values shown as before->after."
+        printf '%-14s %-9s %-22s %s\n' bdf role dpc_ctl uncorr_severity
+    } >> "$MANIFEST"
+
+    while read -r idx bdf role; do
+        [[ -n "$bdf" ]] || continue
+        dpc_note="-"; sev_note="-"
+
+        # 1. DPC trigger off — downstream-facing ports only; endpoints have no DPC
+        if [[ "$role" != "dev" ]]; then
+            if cur=$(pcie_reg_read "$bdf" ECAP_DPC+0x06.W); then
+                readable=$((readable + 1))
+                new=$(printf '%04x' $(( 0x$cur & ~0x3 )))
+                if [[ "$new" == "$cur" ]]; then
+                    dpc_note="$cur (already off)"
+                elif pcie_reg_write_verify "$bdf" ECAP_DPC+0x06.W "$new"; then
+                    dpc_note="$cur->$new"
+                    PCIE_POLICY_UNDO+=("$bdf ECAP_DPC+0x06.W $cur")
+                    changed=$((changed + 1))
+                else
+                    dpc_note="$cur->FAILED"
+                    say "WARNING: could not disarm DPC on $bdf"
+                fi
+            else
+                dpc_note="no-dpc-cap"
+            fi
+        fi
+
+        # 2. severity: demote CmpltTO + UnxCmplt, both ends of every link
+        if cur=$(pcie_reg_read "$bdf" ECAP_AER+0x0c.L); then
+            readable=$((readable + 1))
+            new=$(printf '%08x' $(( 0x$cur & ~PCIE_SEV_DEMOTE )))
+            if [[ "$new" == "$cur" ]]; then
+                sev_note="$cur (already spec-compliant)"
+            elif pcie_reg_write_verify "$bdf" ECAP_AER+0x0c.L "$new"; then
+                sev_note="$cur->$new"
+                PCIE_POLICY_UNDO+=("$bdf ECAP_AER+0x0c.L $cur")
+                changed=$((changed + 1))
+            else
+                sev_note="$cur->FAILED"
+                say "WARNING: could not set severity on $bdf"
+            fi
+        else
+            sev_note="no-aer-cap"
+        fi
+
+        printf '%-14s %-9s %-22s %s\n' "$bdf" "$role" "$dpc_note" "$sev_note" \
+            >> "$MANIFEST"
+    done < <(aer_targets | sort -u -k2,2)
+
+    # Fail closed: readable registers but nothing written means setpci cannot
+    # write — almost always missing passwordless sudo. Running anyway would
+    # produce a bundle that looks like a policy run and is not one.
+    if (( readable > 0 && changed == 0 )); then
+        echo "ERROR: --relax-pcie-errors changed nothing despite readable registers." >&2
+        echo "       Check that 'sudo -n setpci' works without a password prompt." >&2
+        exit 1
+    fi
+    if (( readable == 0 )); then
+        echo "ERROR: --relax-pcie-errors could not read any AER/DPC register." >&2
+        echo "       setpci needs root for extended config space (offset >= 0x100)." >&2
+        exit 1
+    fi
+    say "PCIe error policy: $changed register(s) changed, originals in manifest"
+}
+
+restore_pcie_error_policy() {
+    (( ${#PCIE_POLICY_UNDO[@]} )) || return 0
+    local e bdf reg val n=0
+    for e in "${PCIE_POLICY_UNDO[@]}"; do
+        read -r bdf reg val <<< "$e"
+        sudo -n setpci -s "$bdf" "$reg=$val" 2>/dev/null && n=$((n + 1))
+    done
+    say "restored $n/${#PCIE_POLICY_UNDO[@]} PCIe error-policy register(s)"
+}
+
+if [[ $RELAX_PCIE_ERRORS -eq 1 ]]; then
+    apply_pcie_error_policy
+fi
+
 say "run dir: $RUNDIR"
 say "launching: $BIN ${ARGS[*]}"
 say "START $(ts_iso)"
@@ -762,6 +909,13 @@ if [[ "$SETTLE_SECONDS" -gt 0 ]]; then
     say "settling ${SETTLE_SECONDS}s before the post-run snapshot (collectors still running)"
     sleep "$SETTLE_SECONDS"
     say "SETTLED $(ts_iso)"
+fi
+
+# Restore only on a clean exit. After a fault the port may be contained or the
+# endpoint gone, and writing config space to a device in that state is not worth
+# the risk — the settings do not survive a reboot anyway.
+if [[ $RELAX_PCIE_ERRORS -eq 1 && $RC -eq 0 ]]; then
+    restore_pcie_error_policy
 fi
 
 # --- post-run capture ----------------------------------------------------
