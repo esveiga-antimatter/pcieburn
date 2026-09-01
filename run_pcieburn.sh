@@ -45,6 +45,9 @@ SETTLE_SECONDS=30
 DURATION=""
 ASSUME_YES=0
 RELAX_PCIE_ERRORS=0
+WITH_LANES=0
+LANE_INTERVAL=0
+LANE_TARGETS=""
 declare -a PCIE_POLICY_UNDO=()
 PASSTHRU=()
 
@@ -83,6 +86,26 @@ Wrapper options:
                       Originals are recorded in the manifest and restored on a
                       clean exit. OFF BY DEFAULT: it removes containment, so a
                       fault takes the host down harder than it otherwise would.
+  --with-lanes        record per-lane PCIe error state. Lane Error Status is
+                      a latch, not a counter, so this clears it at load start
+                      and reports the union over the run -- which is what makes
+                      a hit attributable to THIS run rather than to some earlier
+                      one on the same boot. Also snapshots Gen5 equalisation
+                      state (EQ complete/phase/request and the per-lane
+                      transmitter presets), the per-boot covariate that decides
+                      how a link behaves and that nothing else here records.
+                      Reads need passwordless sudo; clearing is a config-space
+                      WRITE, so this is opt-in.
+  --lane-interval SEC poll and clear during load as well, giving timing for a
+                      burst rather than just a per-run union (default 0 = off,
+                      snapshot at start and end only). Writing config space on a
+                      marginal link under load can itself perturb the link: run
+                      a matched pair with and without before trusting a run
+                      that used it.
+  --lane-targets LIST comma-separated BDFs to restrict lane monitoring to
+                      (default: every device --with-aer would watch). Narrowing
+                      to the one suspect link is the way to keep the added
+                      config-space traffic small.
   --yes               skip the interactive safety confirmation
   -h, --help          this message
 
@@ -169,6 +192,9 @@ while [[ $# -gt 0 ]]; do
         --nvml-interval) NVML_INTERVAL_MS="$2"; shift 2 ;;
         --settle)        SETTLE_SECONDS="$2"; shift 2 ;;
         --relax-pcie-errors) RELAX_PCIE_ERRORS=1; shift ;;
+        --with-lanes)    WITH_LANES=1; shift ;;
+        --lane-interval) LANE_INTERVAL="$2"; WITH_LANES=1; shift 2 ;;
+        --lane-targets)  LANE_TARGETS="$2"; WITH_LANES=1; shift 2 ;;
         --yes|-y)        ASSUME_YES=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         --)              shift; PASSTHRU=("$@"); break ;;
@@ -197,6 +223,9 @@ AER="$RUNDIR/aer_counters.csv"
 AERDELTA="$RUNDIR/aer_delta.txt"
 AER_UNCORR="$RUNDIR/aer_uncorrectable.csv"
 AER_BASE="$RUNDIR/aer_baseline.txt"
+LANES="$RUNDIR/lane_errors.csv"
+LANE_BASE="$RUNDIR/lane_baseline.txt"
+LANEDELTA="$RUNDIR/lane_delta.txt"
 PSUCSV="$RUNDIR/psu_current.csv"
 PMBUSCSV="$RUNDIR/psu_pmbus.csv"
 PSUSUM="$RUNDIR/psu_summary.txt"
@@ -668,12 +697,16 @@ on_off() { [[ "$1" -eq 1 ]] && echo "on${2:+  $2}" || echo "off"; }
     printf 'aer               : %s\n' "$(on_off "$WITH_AER" "${AER_INTERVAL}s")"
     printf 'psu_bmc           : %s\n' "$(on_off "$WITH_PSU" "${PSU_INTERVAL}s")"
     printf 'psu_pmbus         : %s\n' "$(on_off "$WITH_PSU_PMBUS" "${PSU_INTERVAL}s")"
+    printf 'lanes             : %s\n' \
+        "$(on_off "$WITH_LANES" "$(awk -v v="$LANE_INTERVAL" \
+            'BEGIN{print (v+0>0) ? v "s poll" : "snapshot only"}')")"
 } >> "$MANIFEST"
 
 # --- cleanup: never leave orphans behind ---------------------------------
 BURN_PID=""
 TAIL_PID=""
 : "${AER_PID:=}"
+: "${LANE_PID:=}"
 : "${DMON_PID:=}"
 : "${NVML_PID:=}"
 : "${PSU_PID:=}"
@@ -717,6 +750,12 @@ cleanup() {
         say "stopping AER counter poll"
         kill -TERM "$AER_PID" 2>/dev/null
         wait "$AER_PID" 2>/dev/null
+    fi
+
+    if [[ -n "$LANE_PID" ]] && kill -0 "$LANE_PID" 2>/dev/null; then
+        say "stopping per-lane error poll"
+        kill -TERM "$LANE_PID" 2>/dev/null
+        wait "$LANE_PID" 2>/dev/null
     fi
 
     if [[ -n "${PMBUS_PID:-}" ]] && kill -0 "$PMBUS_PID" 2>/dev/null; then
@@ -789,7 +828,7 @@ pcie_reg_write_verify() {      # bdf regspec newvalue -> 0 ok, 1 failed
 
 apply_pcie_error_policy() {
     local idx bdf role cur new dpc_note sev_note
-    local changed=0 readable=0
+    local changed=0 readable=0 attempted=0 already=0
 
     {
         echo
@@ -810,13 +849,17 @@ apply_pcie_error_policy() {
                 new=$(printf '%04x' $(( 0x$cur & ~0x3 )))
                 if [[ "$new" == "$cur" ]]; then
                     dpc_note="$cur (already off)"
-                elif pcie_reg_write_verify "$bdf" ECAP_DPC+0x06.W "$new"; then
-                    dpc_note="$cur->$new"
-                    PCIE_POLICY_UNDO+=("$bdf ECAP_DPC+0x06.W $cur")
-                    changed=$((changed + 1))
+                    already=$((already + 1))
                 else
-                    dpc_note="$cur->FAILED"
-                    say "WARNING: could not disarm DPC on $bdf"
+                    attempted=$((attempted + 1))
+                    if pcie_reg_write_verify "$bdf" ECAP_DPC+0x06.W "$new"; then
+                        dpc_note="$cur->$new"
+                        PCIE_POLICY_UNDO+=("$bdf ECAP_DPC+0x06.W $cur")
+                        changed=$((changed + 1))
+                    else
+                        dpc_note="$cur->FAILED"
+                        say "WARNING: could not disarm DPC on $bdf"
+                    fi
                 fi
             else
                 dpc_note="no-dpc-cap"
@@ -828,14 +871,18 @@ apply_pcie_error_policy() {
             readable=$((readable + 1))
             new=$(printf '%08x' $(( 0x$cur & ~PCIE_SEV_DEMOTE )))
             if [[ "$new" == "$cur" ]]; then
-                sev_note="$cur (already spec-compliant)"
-            elif pcie_reg_write_verify "$bdf" ECAP_AER+0x0c.L "$new"; then
-                sev_note="$cur->$new"
-                PCIE_POLICY_UNDO+=("$bdf ECAP_AER+0x0c.L $cur")
-                changed=$((changed + 1))
+                sev_note="$cur (already demoted)"
+                already=$((already + 1))
             else
-                sev_note="$cur->FAILED"
-                say "WARNING: could not set severity on $bdf"
+                attempted=$((attempted + 1))
+                if pcie_reg_write_verify "$bdf" ECAP_AER+0x0c.L "$new"; then
+                    sev_note="$cur->$new"
+                    PCIE_POLICY_UNDO+=("$bdf ECAP_AER+0x0c.L $cur")
+                    changed=$((changed + 1))
+                else
+                    sev_note="$cur->FAILED"
+                    say "WARNING: could not set severity on $bdf"
+                fi
             fi
         else
             sev_note="no-aer-cap"
@@ -845,11 +892,27 @@ apply_pcie_error_policy() {
             >> "$MANIFEST"
     done < <(aer_targets | sort -u -k2,2)
 
-    # Fail closed: readable registers but nothing written means setpci cannot
-    # write — almost always missing passwordless sudo. Running anyway would
-    # produce a bundle that looks like a policy run and is not one.
-    if (( readable > 0 && changed == 0 )); then
-        echo "ERROR: --relax-pcie-errors changed nothing despite readable registers." >&2
+    # Provenance: a bundle must say whether THIS run established the policy or
+    # merely inherited it. Those two produce identical register values and used
+    # to be indistinguishable after the fact.
+    {
+        printf 'policy summary    : %d changed, %d already in target state, %d write(s) failed\n' \
+            "$changed" "$already" "$(( attempted - changed ))"
+        if (( changed == 0 && already > 0 )); then
+            echo '                    inherited from an earlier run; nothing to restore at exit'
+        fi
+    } >> "$MANIFEST"
+
+    # Fail closed on the condition that actually means "setpci cannot write":
+    # something needed changing and none of it landed — almost always missing
+    # passwordless sudo. Registers ALREADY in the target state are a different
+    # condition and must not abort: the wrapper only restores on a clean exit,
+    # so any run following a faulted one legitimately starts with the policy
+    # already applied. Conflating the two aborted valid reruns, and did so
+    # AFTER the manifest header had been written, leaving a stub bundle that
+    # looked like a policy run.
+    if (( attempted > 0 && changed == 0 )); then
+        echo "ERROR: --relax-pcie-errors could not write any register that needed it." >&2
         echo "       Check that 'sudo -n setpci' works without a password prompt." >&2
         exit 1
     fi
@@ -858,7 +921,13 @@ apply_pcie_error_policy() {
         echo "       setpci needs root for extended config space (offset >= 0x100)." >&2
         exit 1
     fi
-    say "PCIe error policy: $changed register(s) changed, originals in manifest"
+    if (( changed == 0 && already > 0 )); then
+        say "PCIe error policy: all $already register(s) already in target state,"
+        say "  inherited from an earlier run that did not restore them; this run"
+        say "  will not restore anything at exit"
+    else
+        say "PCIe error policy: $changed changed, $already already set, originals in manifest"
+    fi
 }
 
 restore_pcie_error_policy() {
@@ -873,6 +942,142 @@ restore_pcie_error_policy() {
 
 if [[ $RELAX_PCIE_ERRORS -eq 1 ]]; then
     apply_pcie_error_policy
+fi
+
+# --- per-lane PCIe error state (--with-lanes) ------------------------------
+# Lane Error Status (Secondary PCIe Extended Capability + 0x08) is one bit per
+# lane and is RW1CS: a latch, not a counter. Once a lane's bit sets it stays set
+# until written-1-to-clear, so sampling it the way aer_counters.csv samples the
+# AER counters would return the same value forever -- many identical rows
+# describing one event. This collector therefore CLEARS at load start and
+# reports the union over the run, which is what makes a hit attributable to this
+# run rather than to some earlier one on the same boot.
+#
+# Why it earns its place: it is the only register in the bundle that resolves a
+# link fault to a lane, and therefore the only one that can say whether the same
+# physical lane is implicated at BOTH ends. On cor04 the root port 00:01.1 and
+# the endpoint 01:00.0 both report lane 15 -- which, absent lane reversal,
+# localises the fault to one lane rather than to two independent marginalities.
+# That reading was latched across a whole uptime containing four runs, so it
+# could not be attributed to any one of them. Per-run clearing is the fix.
+#
+# Registers, all per-lane:
+#   ECAP_SECPCI + 0x08 (32-bit) Lane Error Status                       RW1CS
+#   ECAP_16GT   + 0x10 (32-bit) 16.0 GT/s Local Data Parity Mismatch    RW1CS
+#   ECAP002a    + 0x0c (32-bit) 32.0 GT/s Status                    read-only
+#   ECAP002a    + 0x20..0x2f    32.0 GT/s per-lane Tx presets       read-only
+# pciutils has no ECAP_PL32G alias as of 3.15, so the Gen5 capability is
+# addressed by its numeric id. lspci does not decode it either.
+LANE_REGS="ECAP_SECPCI+0x08.L:LaneErrStat ECAP_16GT+0x10.L:DataParityMismatch"
+
+lane_decode() {            # hex mask (no 0x) -> "0,15" or "-"
+    local v i out=""
+    [[ -n "${1:-}" ]] || { printf -- '-'; return; }
+    v=$((16#$1))
+    for (( i = 0; i < 32; i++ )); do
+        (( (v >> i) & 1 )) && out+="${out:+,}$i"
+    done
+    printf '%s' "${out:--}"
+}
+
+lane_sample() {            # targets outfile clear(0|1); logs nonzero rows only
+    local targets="$1" out="$2" clear="$3" ts idx bdf role spec reg name cur
+    ts=$(ts_iso)
+    while read -r idx bdf role; do
+        [[ -n "${bdf:-}" ]] || continue
+        for spec in $LANE_REGS; do
+            reg="${spec%%:*}"; name="${spec##*:}"
+            cur=$(pcie_reg_read "$bdf" "$reg") || continue
+            [[ "$cur" =~ ^0+$ ]] && continue
+            printf '%s,%s,%s,%s,%s,%s,%s\n' "$ts" "$idx" "$bdf" "$role" \
+                "$name" "$cur" "$(lane_decode "$cur")" >> "$out"
+            if (( clear )); then
+                sudo -n setpci -s "$bdf" "$reg=$cur" 2>/dev/null || true
+            fi
+        done
+    done <<< "$targets"
+    return 0
+}
+
+lane_baseline() {          # targets -> stdout; read-only, nothing is cleared
+    local targets="$1" idx bdf role spec reg name cur o presets
+    local -a preg=()
+    for o in $(seq 32 47); do preg+=("$(printf 'ECAP002a+0x%02x.B' "$o")"); done
+    while read -r idx bdf role; do
+        [[ -n "${bdf:-}" ]] || continue
+        echo
+        echo "=== gpu$idx $bdf ($role) ==="
+        for spec in $LANE_REGS; do
+            reg="${spec%%:*}"; name="${spec##*:}"
+            if cur=$(pcie_reg_read "$bdf" "$reg"); then
+                printf '  %-18s 0x%s  lanes: %s\n' "$name" "$cur" "$(lane_decode "$cur")"
+            else
+                printf '  %-18s capability absent or unreadable\n' "$name"
+            fi
+        done
+        # Gen5 equalisation state. Never cleared, and read-only: this is the
+        # per-boot covariate that decides how a link behaves for the whole boot.
+        # Two runs with identical parameters and different presets are not the
+        # same experiment, and until now nothing in a bundle recorded that.
+        if cur=$(pcie_reg_read "$bdf" "ECAP002a+0x0c.L"); then
+            printf '  %-18s 0x%s  (bit0 EQ-complete, 1-3 phase1-3 ok, 4 EQ-request, 8 precoding)\n' \
+                "PL32G_Status" "$cur"
+            presets=$(sudo -n setpci -s "$bdf" "${preg[@]}" 2>/dev/null | tr '\n' ' ')
+            printf '  %-18s %s\n' "PL32G_Presets" "${presets:-unreadable}"
+            printf '  %-18s %s\n' "" "(one byte per lane 0..15; low nibble = downstream Tx preset, high = upstream)"
+        else
+            printf '  %-18s capability absent (not a Gen5 port?)\n' "PL32G_Status"
+        fi
+    done <<< "$targets"
+    return 0
+}
+
+LANE_PID=""
+LANE_TARGET_LIST=""
+if [[ $WITH_LANES -eq 1 ]]; then
+    LANE_TARGET_LIST=$(aer_targets | sort -u -k2,2)
+    if [[ -n "$LANE_TARGETS" ]]; then
+        LANE_TARGET_LIST=$(awk -v want=",${LANE_TARGETS//[[:space:]]/}," \
+            'index(want, "," $2 ",")' <<< "$LANE_TARGET_LIST")
+    fi
+    if [[ -z "$LANE_TARGET_LIST" ]]; then
+        say "WARNING: --with-lanes matched no devices; skipping lane capture"
+        WITH_LANES=0
+    elif ! pcie_reg_read "$(awk 'NR==1{print $2}' <<< "$LANE_TARGET_LIST")" \
+              ECAP_SECPCI+0x08.L >/dev/null; then
+        # Fail soft, not closed: unlike --relax-pcie-errors this only observes,
+        # so a bundle without it is still a valid run -- just one that cannot
+        # answer the per-lane question. The manifest records that it was off.
+        say "WARNING: Lane Error Status unreadable (extended config space needs"
+        say "         passwordless sudo); skipping lane capture"
+        WITH_LANES=0
+    else
+        {
+            echo "Per-lane baseline at $(ts_iso)"
+            echo "(PRE-CLEAR. These bits accumulate since the last link training"
+            echo " or the last time anything cleared them, which may be several"
+            echo " runs and several hours ago -- so they are NOT attributable to"
+            echo " this run. They are cleared immediately after this snapshot;"
+            echo " lane_delta.txt is the figure scoped to this run.)"
+            lane_baseline "$LANE_TARGET_LIST"
+        } > "$LANE_BASE" 2>&1
+
+        echo "timestamp,gpu,bdf,role,register,mask,lanes" > "$LANES"
+        lane_sample "$LANE_TARGET_LIST" /dev/null 1     # clear; baseline is saved
+
+        if awk -v v="$LANE_INTERVAL" 'BEGIN{exit !(v+0 > 0)}'; then
+            say "polling per-lane error status every ${LANE_INTERVAL}s -> $LANES"
+            (
+                while :; do
+                    sleep "$LANE_INTERVAL"
+                    lane_sample "$LANE_TARGET_LIST" "$LANES" 1
+                done
+            ) &
+            LANE_PID=$!
+        else
+            say "per-lane error status cleared; single read at end -> $LANEDELTA"
+        fi
+    fi
 fi
 
 say "run dir: $RUNDIR"
@@ -1039,6 +1244,48 @@ fi
 : "${DEGRADED_LINK:=0}"
 : "${DEGRADED_WHAT:=}"
 : "${POST_FATAL:=0}"
+
+
+# Per-lane delta — which lanes errored during THIS run, at each end of each link.
+# Scoped by the clear at load start, so unlike lane_baseline.txt it is not
+# contaminated by earlier runs on the same boot. The poller is stopped first so
+# it cannot clear a register between the final read and this table.
+if [[ $WITH_LANES -eq 1 && -n "$LANE_TARGET_LIST" ]]; then
+    if [[ -n "$LANE_PID" ]] && kill -0 "$LANE_PID" 2>/dev/null; then
+        kill -TERM "$LANE_PID" 2>/dev/null
+        wait "$LANE_PID" 2>/dev/null
+        LANE_PID=""
+    fi
+    lane_sample "$LANE_TARGET_LIST" "$LANES" 0      # final read, no clear
+    {
+        echo "Per-lane errors during this run (union over all samples)"
+        echo
+        declare -A LANE_UNION=()
+        while IFS=',' read -r _ts _idx _bdf _role _reg _mask _lanes; do
+            [[ "$_ts" == "timestamp" || -z "${_mask:-}" ]] && continue
+            _k="$_bdf|$_role|$_reg"
+            LANE_UNION["$_k"]=$(printf '%08x' \
+                $(( 0x${LANE_UNION["$_k"]:-0} | 0x$_mask )))
+        done < "$LANES"
+        if (( ${#LANE_UNION[@]} == 0 )); then
+            echo "  none — no monitored device logged a lane error this run"
+        else
+            printf '%-14s %-9s %-20s %-12s %s\n' bdf role register mask lanes
+            for _k in "${!LANE_UNION[@]}"; do
+                IFS='|' read -r _bdf _role _reg <<< "$_k"
+                printf '%-14s %-9s %-20s 0x%-10s %s\n' "$_bdf" "$_role" "$_reg" \
+                    "${LANE_UNION[$_k]}" "$(lane_decode "${LANE_UNION[$_k]}")"
+            done | sort
+        fi
+        echo
+        echo "The same lane index at BOTH ends of a link localises the fault to"
+        echo "one physical lane, absent lane reversal. Different indices at each"
+        echo "end means two independent marginalities. Lane reversal is not"
+        echo "exposed in config space, so confirm it before relying on the first"
+        echo "reading."
+    } > "$LANEDELTA" 2>&1
+    say "per-lane delta -> $LANEDELTA"
+fi
 
 # AER delta table — per-link accumulation of correctable errors over this run.
 # This is the discriminating measurement: it ranks the eight links against each
