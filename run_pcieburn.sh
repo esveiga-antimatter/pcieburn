@@ -208,9 +208,12 @@ if [[ ! -x "$BIN" ]]; then
     echo "       build it first:  make -C $HERE" >&2
     exit 1
 fi
-
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RUNDIR="$OUTDIR_BASE/${STAMP}${TAG:+-$TAG}"
+COMMITLABEL="$(git rev-parse HEAD | cut -c1-6)"
+BINLABEL="$(sha256sum pcieburn | cut -c1-6)"
+MYNAME="$(hostname)"
+PREFIX="${STAMP}-${COMMITLABEL}-${BINLABEL}-${MYNAME}"
+RUNDIR="$OUTDIR_BASE/${PREFIX}${TAG:+-$TAG}"
 mkdir -p "$RUNDIR" || { echo "ERROR: cannot create $RUNDIR" >&2; exit 1; }
 
 MANIFEST="$RUNDIR/manifest.txt"
