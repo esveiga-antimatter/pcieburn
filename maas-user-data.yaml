@@ -1,0 +1,276 @@
+#cloud-config
+#
+# MAAS user_data for a pcieburn test node.
+#
+# Brings an Ubuntu machine (22.04 / 24.04, amd64 or arm64) up to the point where
+# `make` and `./run_pcieburn.sh` both work, per README "Requirements":
+#
+#   build    nvcc + cuBLAS + CUDA runtime (C++17), nccl.h + libnccl.so, g++, make
+#   run      a driver matching the toolkit, 2+ visible GPUs
+#   wrapper  nvidia-smi, readable dmesg, gawk (mktime), lspci/setpci, ipmitool,
+#            column, timeout, sensors, python3 (stdlib only)
+#
+# Deliberately does NOT set persistence mode, clocks, or any global GPU state:
+# run_pcieburn.sh is written not to touch those, and a provisioning script that
+# does would silently change what the test measures.
+#
+# Usage in MAAS:
+#   maas $PROFILE machine deploy $SYSTEM_ID user_data="$(base64 -w0 maas-user-data.yaml)"
+# or paste into the "Cloud-init user-data" box on the deploy form.
+#
+# Tunables live in /etc/default/pcieburn (written below). Edit and re-run
+# /usr/local/sbin/pcieburn-build.sh to change CUDA branch, SM, or source.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  # toolchain
+  - build-essential
+  - git
+  - make
+  - pkg-config
+  # wrapper + linkcheck.sh + aerpolicy.sh runtime
+  - gawk              # linkcheck dwell window needs gawk's mktime, not mawk
+  - pciutils          # lspci, setpci
+  - ipmitool          # BMC PSU sensors and the ASRock PMBus bridge
+  - lm-sensors
+  - bsdextrautils     # column(1)
+  - python3           # psu_pmbus_poll.py / gpucompare.py are stdlib-only
+  - dmidecode
+  - curl
+  - ca-certificates
+  - gnupg
+  # Picks the right signed prebuilt NVIDIA module for the running kernel.
+  # No dkms, no linux-headers: the module is built and signed by Canonical.
+  - ubuntu-drivers-common
+
+write_files:
+  # ipmitool talks to the BMC through the kernel IPMI device. Without these the
+  # wrapper's PSU collectors self-disable with a warning and the run loses the
+  # psu_current.csv / psu_pmbus.csv channels entirely.
+  - path: /etc/modules-load.d/ipmi.conf
+    permissions: '0644'
+    content: |
+      ipmi_msghandler
+      ipmi_devintf
+      ipmi_si
+
+  # The wrapper diffs dmesg before/after the load to produce dmesg_delta.txt and
+  # faults.txt (PCIe/Xid/AER lines). Ubuntu ships dmesg_restrict=1, under which
+  # those snapshots come back empty and the fault evidence is silently lost.
+  - path: /etc/sysctl.d/99-pcieburn.conf
+    permissions: '0644'
+    content: |
+      kernel.dmesg_restrict = 0
+
+  - path: /etc/default/pcieburn
+    permissions: '0644'
+    content: |
+      # CUDA branch to install. 13-0 matches the node this was developed
+      # against (driver 580.178.04 / CUDA 13.0).
+      CUDA_BRANCH=13-0
+
+      # Driver branch, installed as Canonical's prebuilt signed kernel module
+      # (linux-modules-nvidia-*) rather than DKMS, so the node boots with
+      # Secure Boot on and no MOK enrolled. "open" is not optional on
+      # Blackwell/sm_120 -- the proprietary module does not support it.
+      DRIVER_BRANCH=580
+      DRIVER_VARIANT=open
+
+      # Source. Leave PCIEBURN_REPO empty to skip the clone and build from a
+      # tree you have already put at $PCIEBURN_SRC yourself.
+      PCIEBURN_REPO=https://github.com/esveiga-antimatter/pcieburn.git
+      PCIEBURN_REF=master
+      PCIEBURN_SRC=/opt/pcieburn
+
+      # sm_ target. "auto" reads compute_cap from nvidia-smi (RTX 5090 -> 120).
+      PCIEBURN_SM=auto
+
+      # Run artifacts are tens of MB each; keep them off /.
+      PCIEBURN_RUNS=/var/lib/pcieburn/runs
+
+  - path: /usr/local/sbin/pcieburn-provision.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Two sources, deliberately: the kernel module comes from Ubuntu's own
+      # archive as a Canonical-signed prebuilt binary (no DKMS, so it loads
+      # under Secure Boot with no MOK enrolled and survives a kernel upgrade),
+      # while nvcc/cuBLAS/NCCL come from NVIDIA's repo, which carries CUDA 13.
+      set -euo pipefail
+      . /etc/default/pcieburn
+      export DEBIAN_FRONTEND=noninteractive
+
+      . /etc/os-release
+      kver=$(uname -r)
+      br="${DRIVER_BRANCH}${DRIVER_VARIANT:+-$DRIVER_VARIANT}"     # 580-open
+
+      # --- driver: prebuilt signed module + no-dkms userspace -----------------
+      # linux-modules-nvidia-<branch>-<kver> is the exact-kernel build; the
+      # -generic[-hwe-<rel>] metapackage is what follows future kernel ABI
+      # bumps, so install both and let the second one be best-effort.
+      apt-get install -y "linux-modules-nvidia-${br}-${kver}" || {
+          echo "pcieburn-provision: no prebuilt ${br} module for ${kver};" >&2
+          echo "  falling back to ubuntu-drivers autodetect" >&2
+          ubuntu-drivers install --gpgpu || true
+      }
+      for meta in "linux-modules-nvidia-${br}-generic-hwe-${VERSION_ID}" \
+                  "linux-modules-nvidia-${br}-generic"; do
+          apt-get install -y "$meta" && break
+      done || true
+
+      # -no-dkms- is the load-bearing part of this name: the plain
+      # nvidia-headless-<branch> metapackage would drag nvidia-dkms back in and
+      # rebuild an unsigned module on top of the signed one.
+      apt-get install -y "nvidia-headless-no-dkms-${br}" "nvidia-utils-${DRIVER_BRANCH}"
+
+      # --- NVIDIA repo, toolkit only -----------------------------------------
+      # NVIDIA's repo also ships driver packages, and they are DKMS. Pin every
+      # driver-shaped package from that host out of consideration so an
+      # `apt upgrade` cannot quietly swap the signed module for a built one.
+      cat > /etc/apt/preferences.d/99-pcieburn-nvidia-driver <<'EOF'
+      Package: nvidia-* libnvidia-* linux-modules-nvidia-* linux-objects-nvidia-* linux-signatures-nvidia-*
+      Pin: origin "developer.download.nvidia.com"
+      Pin-Priority: -1
+      EOF
+      chmod 0644 /etc/apt/preferences.d/99-pcieburn-nvidia-driver
+
+      distro="${ID}${VERSION_ID//./}"            # ubuntu2404
+      case "$(uname -m)" in
+          x86_64)  arch=x86_64 ;;
+          aarch64) arch=sbsa ;;
+          *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
+      esac
+      base="https://developer.download.nvidia.com/compute/cuda/repos/${distro}/${arch}"
+
+      if [[ ! -f /usr/share/keyrings/cuda-archive-keyring.gpg ]]; then
+          tmp=$(mktemp -d)
+          curl -fsSL --retry 5 --retry-delay 5 \
+               -o "$tmp/cuda-keyring.deb" "${base}/cuda-keyring_1.1-1_all.deb"
+          dpkg -i "$tmp/cuda-keyring.deb"
+          rm -rf "$tmp"
+      fi
+      apt-get update
+
+      # cuda-toolkit-* pulls nvcc, cuBLAS and the CUDA runtime without dragging
+      # in a second copy of the driver the way the `cuda` meta package does.
+      apt-get install -y "cuda-toolkit-${CUDA_BRANCH}"
+
+      # NCCL. The Makefile finds nccl.h under CUDA_HOME or /usr; the Debian
+      # package puts libnccl.so in the multiarch dir, which its NCCL_LIBDIR
+      # search already covers.
+      apt-get install -y libnccl2 libnccl-dev
+
+      # The Makefile defaults CUDA_HOME=/usr/local/cuda. Versioned toolkit
+      # packages do not always leave that symlink behind.
+      if [[ ! -e /usr/local/cuda ]]; then
+          ln -sfn "/usr/local/cuda-${CUDA_BRANCH//-/.}" /usr/local/cuda
+      fi
+
+      cat > /etc/profile.d/cuda.sh <<'EOF'
+      export CUDA_HOME=/usr/local/cuda
+      export PATH="$CUDA_HOME/bin:$PATH"
+      export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      EOF
+      chmod 0644 /etc/profile.d/cuda.sh
+
+      # Pin the GPU stack: an unattended-upgrade of the driver mid-investigation
+      # invalidates comparisons across runs. The linux-modules-nvidia
+      # metapackage is deliberately NOT held -- it has to stay free to follow a
+      # kernel ABI bump, or the next kernel boots with no NVIDIA module at all.
+      apt-mark hold "nvidia-headless-no-dkms-${br}" "nvidia-utils-${DRIVER_BRANCH}" \
+                    "cuda-toolkit-${CUDA_BRANCH}" libnccl2 libnccl-dev 2>/dev/null || true
+
+      mkdir -p "$PCIEBURN_RUNS"
+      echo "pcieburn-provision: driver ${br} (signed, no dkms) + CUDA ${CUDA_BRANCH} installed"
+
+  - path: /usr/local/sbin/pcieburn-build.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Fetch the source and build ./pcieburn. Idempotent, and safe to run before
+      # the NVIDIA module has loaded: SM detection falls back to the Makefile's
+      # own default (120, RTX 5090) rather than failing the boot.
+      set -euo pipefail
+      . /etc/default/pcieburn
+
+      if [[ -n "${PCIEBURN_REPO:-}" ]]; then
+          if [[ -d "$PCIEBURN_SRC/.git" ]]; then
+              git -C "$PCIEBURN_SRC" fetch --all --quiet || true
+              git -C "$PCIEBURN_SRC" checkout --quiet "$PCIEBURN_REF" || true
+              git -C "$PCIEBURN_SRC" pull --ff-only --quiet || true
+          else
+              git clone --branch "$PCIEBURN_REF" "$PCIEBURN_REPO" "$PCIEBURN_SRC" || {
+                  echo "pcieburn-build: clone of $PCIEBURN_REPO failed." >&2
+                  echo "  check network/proxy, or rsync the tree to $PCIEBURN_SRC" >&2
+                  echo "  and re-run this script." >&2
+              }
+          fi
+      fi
+      [[ -f "$PCIEBURN_SRC/Makefile" ]] || { echo "pcieburn-build: no source at $PCIEBURN_SRC, nothing to build"; exit 0; }
+
+      sm="$PCIEBURN_SM"
+      if [[ "$sm" == auto ]]; then
+          cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .')
+          if [[ "$cap" =~ ^[0-9]+$ ]]; then
+              sm="$cap"
+          else
+              echo "pcieburn-build: nvidia-smi gave no compute_cap (driver not loaded yet?); using Makefile default"
+              sm=""
+          fi
+      fi
+
+      cd "$PCIEBURN_SRC"
+      make preflight ${sm:+SM=$sm} || true
+      make ${sm:+SM=$sm}
+      ln -sfn "$PCIEBURN_SRC/pcieburn" /usr/local/bin/pcieburn
+      echo "pcieburn-build: built $PCIEBURN_SRC/pcieburn${sm:+ for sm_$sm}"
+
+  # Safety net. The signed module is loadable as soon as it is unpacked, so the
+  # build normally succeeds inside cloud-init; this unit only covers the cases
+  # where it did not (no network for the clone, GPUs not yet enumerated) so a
+  # node is never left half-provisioned waiting on a human.
+  - path: /etc/systemd/system/pcieburn-build.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Build pcieburn
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/opt/pcieburn/pcieburn
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/pcieburn-build.sh
+      TimeoutStartSec=1800
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [ sysctl, --system ]
+  - [ modprobe, ipmi_msghandler ]
+  - [ modprobe, ipmi_devintf ]
+  - [ modprobe, ipmi_si ]
+  - [ /usr/local/sbin/pcieburn-provision.sh ]
+  # Load it now so SM autodetection in the build below sees the real GPUs
+  # instead of falling back to the Makefile default.
+  - [ sh, -c, "modprobe nvidia || true" ]
+  - [ systemctl, enable, pcieburn-build.service ]
+  - [ /usr/local/sbin/pcieburn-build.sh ]
+
+final_message: |
+  pcieburn node ready after $UPTIME seconds.
+
+  Verify:    cd /opt/pcieburn && make preflight && sudo ./linkcheck.sh
+  Run:       sudo ./run_pcieburn.sh --duration 90 --tag baseline \
+                 --outdir /var/lib/pcieburn/runs
+
+  The NVIDIA kernel module is Canonical's prebuilt signed binary, not DKMS, so
+  Secure Boot needs no MOK enrolled. Confirm with:
+      nvidia-smi && cat /sys/module/nvidia/taint 2>/dev/null
+
+  If the build was skipped, run /usr/local/sbin/pcieburn-build.sh by hand;
+  pcieburn-build.service also retries it on the next boot.
