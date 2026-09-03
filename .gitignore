@@ -2,7 +2,7 @@
 # trace alone is ~20 MB per hour), and the monorepo's pre-commit gate rejects
 # files over 500 kB — these should never be committed.
 /runs/
-
+/__pycache__/
 # Built binary and objects. pcieburn is compiled on the target node, since the
 # machine this is authored on has no CUDA toolchain (see README "Build").
 /pcieburn

@@ -113,7 +113,9 @@ Set `PCIEBURN_BIN` to point the wrapper at a binary elsewhere.
 | `--yes`, `-y` | off | skip the safety confirmation |
 | `--nvml-interval MS` | `100` | NVML sample interval |
 | `--aer-interval SEC` | `1` | AER counter poll interval |
-| `--psu-interval SEC` | `0.25` | PSU poll interval |
+| `--psu-interval SEC` | `0.25` | PSU poll interval, both channels |
+| `--psu-pmbus-interval SEC` | `0.55` | PMBus channel only. Its round is 16 serial reads (4 supplies × VOUT/IOUT/POUT/PIN) and floors at ~0.48 s |
+| `--psu-pmbus-cmds "LIST"` | `"0x8b 0x8c 0x96 0x97"` | PMBus registers to poll. A narrower round samples faster: `"0x8b 0x8c"` is rail voltage and current at 4 Hz, for chasing a 12 V transient rather than measuring an envelope |
 | `--active-supplies N` | `4` | load-sharing PSU count, for the estimated-system-power column only |
 | `--psu-rating W` | `1600` | per-supply rating, for the %-of-rating column |
 
@@ -177,7 +179,7 @@ Written to `runs/<timestamp>[-tag]/`:
 | `pcie_link_baseline.csv`, `pcie_link_states.txt`, `pcie_link_states_load.txt` | link gen/width before the run, and the distinct states observed with sample counts |
 | `pcie_link_rootports*.txt` / `.csv` | root-port link state before and after |
 | `aer_counters.csv`, `aer_delta.txt`, `aer_uncorrectable.csv`, `aer_baseline.txt` | per-device and per-root-port AER counters, and the run's delta |
-| `psu_current.csv`, `psu_pmbus.csv`, `psu_summary.txt` | BMC PSU output current, PMBus per-supply input/output power, min/max/mean summary |
+| `psu_current.csv`, `psu_pmbus.csv`, `psu_summary.txt` | BMC PSU output current; PMBus per-supply 12 V rail, output current and input/output power for all four supplies, plus `vout_spread_v` (the informative aggregate for four supplies on one bus) and `psuN_vout_derived_v` (POUT/IOUT, which cross-checks the rail's LINEAR16 exponent); min/max/mean summary |
 | `dmesg_before.txt`, `dmesg_after.txt`, `dmesg_delta.txt`, `faults.txt` | kernel log snapshots, their diff, and the PCIe/Xid/AER lines from it |
 
 Timestamps are UTC with milliseconds (`YYYY-MM-DDTHH:MM:SS.mmmZ`) throughout,

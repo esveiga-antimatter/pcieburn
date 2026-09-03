@@ -38,6 +38,14 @@ AER_INTERVAL=1
 WITH_PSU=1
 WITH_PSU_PMBUS=1
 PSU_INTERVAL=0.25
+# The PMBus round is 16 serial ~30 ms reads (4 supplies x VOUT/IOUT/POUT/PIN),
+# so it cannot go below ~0.48 s -- unlike the BMC channel's 2 reads, which
+# sustain 0.25 s. One number for both would either warn every run or slow the
+# BMC channel for no reason, so they are separate; --psu-interval still sets
+# both. If a 12 V transient is the target rather than an envelope, a narrower
+# round samples faster: --psu-pmbus-cmds "0x8b 0x8c" is rail+current at 4 Hz.
+PMBUS_INTERVAL=0.55
+PMBUS_CMDS=
 ACTIVE_SUPPLIES=4
 PSU_RATING_W=1600
 NVML_INTERVAL_MS=100
@@ -62,6 +70,20 @@ Wrapper options:
   --outdir DIR        parent directory for run dirs (default ./runs)
   --tag NAME          label for this run, used in the dir name and event log
   --duration SEC      forwarded to pcieburn, and used to size the NVML trace
+  --psu-interval SEC  poll interval for BOTH PSU channels (default 0.25)
+  --psu-pmbus-interval SEC
+                      poll interval for the PMBus channel alone (default 0.55).
+                      Its round is 16 serial reads and cannot go below ~0.48 s;
+                      the poller warns once and records the achieved interval
+                      per row if asked for less. The sensors behind it only
+                      update at ~2-3 Hz, so the default is near their real rate.
+  --psu-pmbus-cmds "LIST"
+                      PMBus registers for the PMBus channel, quoted and space
+                      separated (default "0x8b 0x8c 0x96 0x97" = VOUT, IOUT,
+                      POUT, PIN). Fewer registers means a narrower round and a
+                      faster sample: "0x8b 0x8c" is rail voltage and current at
+                      4 Hz, for chasing a 12 V transient rather than measuring
+                      an envelope. Pair it with --psu-pmbus-interval 0.25.
   --active-supplies N assumed number of load-sharing PSUs, used only for the
                       estimated system power column (default 4, from measured
                       4-way sharing on a 4+1 1600W CRPS chassis)
@@ -139,8 +161,11 @@ ambiguous between "not asked for" and "nothing to report".
   --no-psu-pmbus      skip PMBus, keep the BMC sensors. The two are
                       complementary: PMBus reads per-PSU input and output power
                       for all four supplies over the ASRock bridge via
-                      psu_pmbus_poll.py (read-only commands, 4 Hz, confirmed on
-                      hardware), while the BMC sees only two supplies and is the
+                      psu_pmbus_poll.py (read-only commands, ~1.8 Hz, confirmed
+                      on hardware -- 12 V rail, output current, and input/output
+                      power per supply, plus a VOUT derived from POUT/IOUT that
+                      cross-checks the rail's LINEAR16 decode), while the
+                      BMC sees only two supplies and is the
                       only independent cross-check on those. Aggregate the PMBus
                       CSV with medians; the summary at the end does this for you.
   --no-telemetry      skip every collector above: load only, no measurement.
@@ -186,7 +211,9 @@ while [[ $# -gt 0 ]]; do
         --no-psu-pmbus)  WITH_PSU_PMBUS=0; shift ;;
         --no-telemetry)  WITH_NVML=0; WITH_DMON=0; WITH_AER=0
                          WITH_PSU=0; WITH_PSU_PMBUS=0; shift ;;
-        --psu-interval)  PSU_INTERVAL="$2"; shift 2 ;;
+        --psu-interval)  PSU_INTERVAL="$2"; PMBUS_INTERVAL="$2"; shift 2 ;;
+        --psu-pmbus-interval) PMBUS_INTERVAL="$2"; shift 2 ;;
+        --psu-pmbus-cmds) PMBUS_CMDS="$2"; shift 2 ;;
         --active-supplies) ACTIVE_SUPPLIES="$2"; shift 2 ;;
         --psu-rating)    PSU_RATING_W="$2"; shift 2 ;;
         --nvml-interval) NVML_INTERVAL_MS="$2"; shift 2 ;;
@@ -668,9 +695,10 @@ if [[ $WITH_PSU_PMBUS -eq 1 ]]; then
         say "         Diagnose with: sudo $HERE/psu_pmbus_poll.py --scan"
         WITH_PSU_PMBUS=0
     else
-        say "polling all 4 PSUs over PMBus every ${PSU_INTERVAL}s -> $PMBUSCSV"
+        say "polling all 4 PSUs over PMBus every ${PMBUS_INTERVAL}s -> $PMBUSCSV"
         "$HERE/psu_pmbus_poll.py" --out "$PMBUSCSV" \
-            --interval "$PSU_INTERVAL" >/dev/null 2>"$RUNDIR/psu_pmbus.err" &
+            --interval "$PMBUS_INTERVAL" ${PMBUS_CMDS:+--cmds $PMBUS_CMDS} \
+            >/dev/null 2>"$RUNDIR/psu_pmbus.err" &
         PMBUS_PID=$!
     fi
 fi
@@ -699,7 +727,7 @@ on_off() { [[ "$1" -eq 1 ]] && echo "on${2:+  $2}" || echo "off"; }
     printf 'dmon              : %s\n' "$(on_off "$WITH_DMON" "1s")"
     printf 'aer               : %s\n' "$(on_off "$WITH_AER" "${AER_INTERVAL}s")"
     printf 'psu_bmc           : %s\n' "$(on_off "$WITH_PSU" "${PSU_INTERVAL}s")"
-    printf 'psu_pmbus         : %s\n' "$(on_off "$WITH_PSU_PMBUS" "${PSU_INTERVAL}s")"
+    printf 'psu_pmbus         : %s\n' "$(on_off "$WITH_PSU_PMBUS" "${PMBUS_INTERVAL}s")"
     printf 'lanes             : %s\n' \
         "$(on_off "$WITH_LANES" "$(awk -v v="$LANE_INTERVAL" \
             'BEGIN{print (v+0>0) ? v "s poll" : "snapshot only"}')")"
@@ -1502,13 +1530,25 @@ if [[ $POST_FATAL -eq 1 && $RC -eq 0 ]]; then
     say "      Without --settle this run would have been recorded as clean."
 fi
 if [[ -s "$PMBUSCSV" ]]; then
-    say "  psu_pmbus.csv  all 4 PSUs, input and output power:"
+    say "  psu_pmbus.csv  all 4 PSUs, 12V rail, current, input/output power:"
     awk -F',' '
         NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
         $col["read_ok"] != 1 { bad++; next }
         { n++
           sp[n] = $col["system_pout_w"] + 0
           si[n] = $col["system_pin_w"]  + 0
+          # system_iout_a is absent from a capture taken with --cmds 0x96 0x97;
+          # col[] is then unset, $0 is the whole line, and the sum would be
+          # garbage rather than zero. Guard on the header, not on the value.
+          sa[n] = ("system_iout_a" in col) ? $col["system_iout_a"] + 0 : ""
+          if ("vout_spread_v" in col) {
+              sv[n] = $col["vout_spread_v"] + 0
+              if (sv[n] > wspread) { wspread = sv[n]; wsrow = $col["timestamp"] }
+              for (p = 1; p <= 4; p++) {
+                  vx = $col["psu" p "_vout_v"] + 0
+                  if (vx > 0 && (vlo[p] == 0 || vx < vlo[p])) vlo[p] = vx
+              }
+          }
           for (p = 1; p <= 4; p++) po[p][n] = $col["psu" p "_pout_w"] + 0
           if (n == 1 || sp[n] < lo) lo = sp[n]
           if (n == 1 || sp[n] > hi) hi = sp[n] }
@@ -1522,7 +1562,7 @@ if [[ -s "$PMBUSCSV" ]]; then
             thr = lo + 0.5 * (hi - lo)
             for (i = 1; i <= n; i++) {
                 if (flat || sp[i] >= thr) {
-                    L[++nl] = sp[i]; LI[nl] = si[i]
+                    L[++nl] = sp[i]; LI[nl] = si[i]; LA[nl] = sa[i]
                     for (p = 1; p <= 4; p++) LP[p][nl] = po[p][i]
                 } else I[++ni] = sp[i]
             }
@@ -1535,9 +1575,25 @@ if [[ -s "$PMBUSCSV" ]]; then
                 for (p = 1; p <= 4; p++) {
                     asort(LP[p]); s = s sprintf(" %.0f", LP[p][int(nl/2)+1])
                 }
-                printf "      %s median out %7.1f W  in %7.1f W  (n=%d)\n",
-                       (flat ? "steady" : "loaded"), L[int(nl/2)+1], LI[int(nl/2)+1], nl
+                amps = ""
+                if ("system_iout_a" in col) {
+                    asort(LA)
+                    amps = sprintf("  %.1f A", LA[int(nl/2)+1])
+                }
+                printf "      %s median out %7.1f W  in %7.1f W%s  (n=%d)\n",
+                       (flat ? "steady" : "loaded"), L[int(nl/2)+1],
+                       LI[int(nl/2)+1], amps, nl
                 printf "      %s per-PSU out:%s W\n", (flat ? "steady" : "loaded"), s
+                if ("vout_spread_v" in col) {
+                    # Minimum, not median: a rail sag is the excursion, and a
+                    # median over a run that was mostly fine hides exactly the
+                    # moment worth looking at.
+                    for (p = 1; p <= 4; p++) vstr = vstr sprintf(" %.2f", vlo[p])
+                    printf "      12V rail min per-PSU:%s V\n", vstr
+                    printf "      worst spread between supplies %.2f V", wspread
+                    if (wsrow != "") printf " at %s", wsrow
+                    printf "\n"
+                }
             }
             printf "      %d reads", n
             if (bad > 0) printf ", %d FAILED", bad
