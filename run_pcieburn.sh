@@ -318,7 +318,12 @@ say "uptime at start: $UPTIME_H (booted $BOOT_UTC)"
     # aer_delta.txt may just mean nobody asked for it; in a v5 bundle that
     # channel was either disabled with --no-* or self-disabled for want of a
     # data source, and the "telemetry collectors" section records which.
-    echo "wrapper_version   : 5"
+    # v6: the NVML trace appends memory clock, memory-controller utilization
+    # and clock-event reasons (sw power cap, hw slowdown, sw thermal) after
+    # column 8, probed per driver and recorded as nvml_fields; the post-run
+    # summary adds nvml_clocks_load.txt. Columns 1-8 are unchanged, so v5
+    # parsers still work, but a v5 bundle has no memory-side telemetry.
+    echo "wrapper_version   : 6"
     echo "settle_seconds    : $SETTLE_SECONDS"
     echo "uptime_seconds    : $UPTIME_S"
     echo "uptime_human      : $UPTIME_H"
@@ -473,12 +478,48 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 NVML_PID=""
+# Field order is load-bearing: the post-run downtrain check below reads gen
+# from column 7 and width from column 8, and gpucompare.py reads columns 2-6.
+# New fields are only ever APPENDED after column 8.
+NVML_BASE_FIELDS="timestamp,index,power.draw,clocks.sm,temperature.gpu,utilization.gpu,pcie.link.gen.current,pcie.link.width.current"
+NVML_FIELDS="$NVML_BASE_FIELDS"
+NVML_EXTRA_FIELDS=""
+
+# Memory clock and memory-controller busy time, plus the three clock-event
+# reasons that say WHY clocks are where they are. Together they show whether a
+# power limit reaches the memory subsystem (what decode throughput depends on)
+# and whether a nominal cap was ever actually binding.
+#
+# nvidia-smi rejects the ENTIRE query if any one field is unknown to the
+# installed driver, which would silently cost the whole trace. So each
+# candidate set is probed once, newest names first (clocks_event_reasons.*
+# replaced clocks_throttle_reasons.* in recent drivers), and the first set the
+# driver accepts is used. Fields the driver knows but the part does not
+# support still parse — they just read "[Not Supported]".
+nvml_probe_extra_fields() {
+    local cand
+    for cand in \
+        "clocks.mem,utilization.memory,clocks_event_reasons.sw_power_cap,clocks_event_reasons.hw_slowdown,clocks_event_reasons.sw_thermal_slowdown" \
+        "clocks.mem,utilization.memory,clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_thermal_slowdown" \
+        "clocks.mem,utilization.memory"; do
+        if nvidia-smi --query-gpu="$cand" --format=csv,noheader -i 0 >/dev/null 2>&1; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
 if [[ $WITH_NVML -eq 1 ]]; then
+    if NVML_EXTRA_FIELDS=$(nvml_probe_extra_fields); then
+        NVML_FIELDS="$NVML_BASE_FIELDS,$NVML_EXTRA_FIELDS"
+    else
+        NVML_EXTRA_FIELDS=""
+        say "WARNING: driver accepts none of the memory-clock NVML fields; tracing the base set only"
+    fi
     say "starting NVML trace at ${NVML_INTERVAL_MS}ms -> $NVML"
-    # Field order is load-bearing: the post-run downtrain check below reads
-    # gen from column 7 and width from column 8.
     nvidia-smi \
-        --query-gpu=timestamp,index,power.draw,clocks.sm,temperature.gpu,utilization.gpu,pcie.link.gen.current,pcie.link.width.current \
+        --query-gpu="$NVML_FIELDS" \
         --format=csv,nounits \
         -lms "$NVML_INTERVAL_MS" > "$NVML" 2>"$RUNDIR/nvml_trace.err" &
     NVML_PID=$!
@@ -724,6 +765,7 @@ on_off() { [[ "$1" -eq 1 ]] && echo "on${2:+  $2}" || echo "off"; }
     echo
     echo "--- telemetry collectors (on by default; --no-* to waive) ---"
     printf 'nvml              : %s\n' "$(on_off "$WITH_NVML" "${NVML_INTERVAL_MS}ms")"
+    [[ $WITH_NVML -eq 1 ]] && printf 'nvml_fields       : %s\n' "$NVML_FIELDS"
     printf 'dmon              : %s\n' "$(on_off "$WITH_DMON" "1s")"
     printf 'aer               : %s\n' "$(on_off "$WITH_AER" "${AER_INTERVAL}s")"
     printf 'psu_bmc           : %s\n' "$(on_off "$WITH_PSU" "${PSU_INTERVAL}s")"
@@ -1249,6 +1291,63 @@ if [[ -s "$NVML" ]]; then
             }' "$NVML" 2>/dev/null | sort > "$LINKSTATES_LOAD" || true
     fi
     [[ -s "$LINKSTATES_LOAD" ]] || cp "$LINKSTATES" "$LINKSTATES_LOAD" 2>/dev/null || true
+
+    # Memory-side summary over the same load window: median/min/max memory
+    # clock, mean memory-controller utilization, and the share of samples in
+    # which each clock-event reason was active. Columns are located by header
+    # name, not position, because which extra fields exist depends on what the
+    # driver accepted (see nvml_probe_extra_fields). A GPU whose rows read
+    # [GPU is lost] is skipped from that row on: NVML keeps repeating the last
+    # good clock value for a lost device, so those rows are not live data.
+    CLOCKS_LOAD="$RUNDIR/nvml_clocks_load.txt"
+    if [[ -n "$NVML_EXTRA_FIELDS" ]] && command -v gawk >/dev/null 2>&1 && \
+       [[ -n "${LOAD_T0:-}" && -n "${LOAD_T1:-}" ]]; then
+        gawk -F', *' -v t0="$((LOAD_T0 + 5))" -v t1="$LOAD_T1" '
+            NR == 1 {
+                for (i = 1; i <= NF; i++) {
+                    h = $i
+                    if (h ~ /clocks\.(current\.memory|mem)/) cm = i
+                    else if (h ~ /utilization\.memory/)     um = i
+                    else if (h ~ /sw_power_cap/)            pc = i
+                    else if (h ~ /hw_slowdown/)             hs = i
+                    else if (h ~ /sw_thermal_slowdown/)     ts = i
+                    else if (h ~ /pcie\.link\.width/)       wd = i
+                }
+                next
+            }
+            {
+                split($1, dt, " "); gsub(/[\/:]/, " ", dt[1]); gsub(/:/, " ", dt[2])
+                split(dt[2], tm, " ")
+                ep = mktime(dt[1] " " tm[1] " " tm[2] " " int(tm[3]))
+                if (ep < t0 || ep > t1) next
+                g = $2 + 0
+                if (wd && $wd ~ /lost/) { lost[g] = 1 }
+                if (g in lost) next
+                n[g]++
+                if (cm && $cm ~ /^[0-9.]+$/) { clk[g, ++nc[g]] = $cm + 0 }
+                if (um && $um ~ /^[0-9.]+$/) { us[g] += $um; nu[g]++ }
+                if (pc && $pc ~ /^Active/)   pca[g]++
+                if (hs && $hs ~ /^Active/)   hsa[g]++
+                if (ts && $ts ~ /^Active/)   tsa[g]++
+            }
+            function pct(x, d) { return d ? sprintf("%.1f", 100 * x / d) : "-" }
+            END {
+                printf "gpu\tsamples\tmemclk_med_mhz\tmemclk_min\tmemclk_max\tmemutil_mean_pct\tpwr_cap_pct\thw_slowdown_pct\tsw_thermal_pct\n"
+                PROCINFO["sorted_in"] = "@ind_num_asc"
+                for (g in n) {
+                    k = nc[g]; delete v
+                    for (j = 1; j <= k; j++) v[j] = clk[g, j]
+                    if (k) {
+                        asort(v)
+                        med = (k % 2) ? v[(k + 1) / 2] : (v[k / 2] + v[k / 2 + 1]) / 2
+                        cmed = sprintf("%.0f", med); cmin = v[1]; cmax = v[k]
+                    } else { cmed = cmin = cmax = "-" }
+                    umean = nu[g] ? sprintf("%.1f", us[g] / nu[g]) : "-"
+                    printf "gpu%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", g, n[g], cmed, cmin, cmax, umean,
+                        (pc ? pct(pca[g], n[g]) : "-"), (hs ? pct(hsa[g], n[g]) : "-"), (ts ? pct(tsa[g], n[g]) : "-")
+                }
+            }' "$NVML" > "$CLOCKS_LOAD" 2>/dev/null || rm -f "$CLOCKS_LOAD"
+    fi
     DEGRADED_LINK=0
     DEGRADED_WHAT=""
     DEGRADED_WHAT=$(awk -F'\t' -v ivl="$NVML_INTERVAL_MS" -v maxs="$GEN_DWELL_MAX_S" '
@@ -1456,6 +1555,7 @@ say "  manifest.txt   run provenance, BIOS/topology snapshot, verdict"
 say "  pcieburn.log   timestamped console output"
 say "  events.csv     per-rank event log for telemetry correlation"
 [[ $WITH_NVML -eq 1 ]] && say "  nvml_trace.csv per-GPU NVML trace incl. PCIe link gen/width"
+[[ -s "${CLOCKS_LOAD:-}" ]] && say "  nvml_clocks_load.txt  per-GPU memory clock and clock-event reasons, load window"
 if [[ $WITH_DMON -eq 1 ]]; then
     # dmon reports '-' instead of a rate on parts that do not expose the PCIe
     # throughput counters. That is not a failure, but the file is then empty of
