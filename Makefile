@@ -71,7 +71,7 @@ LDFLAGS += -L$(NCCL_LIBDIR) -Xlinker -rpath -Xlinker $(NCCL_LIBDIR)
 endif
 # No -lrt: everything used here (gettimeofday, usleep) is in libc on modern
 # glibc, and linking it only produced an nvlink warning about skipping librt.a.
-LDFLAGS += -lnccl -lcublas -lcudart
+LDFLAGS += -lnccl -lcublasLt -lcublas -lcudart
 
 TARGET := pcieburn
 
