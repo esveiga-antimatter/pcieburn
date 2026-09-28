@@ -132,7 +132,6 @@ it. The `--with-*` forms are accepted and ignored, for older command lines.
 |---|---|---|
 | `--duration SEC` | `60` | run length |
 | `--matrix-dim N` | `2048` | GEMM dimension (DCGM's default) |
-| `--gemm-n N` | `0` | decode-shaped GEMMs: a `dim × dim` weight matrix times a `dim × N` activation (N = tokens in the batch). `0` = square, compute-bound. At small N (1–64) each GEMM streams its weights from DRAM and every pass reports effective memory GB/s — see [Measuring memory bandwidth](#measuring-memory-bandwidth) |
 | `--precision LIST` | `half,single` | comma list of `half,single,double` |
 | `--gemms-per-coll N` | `0` | GEMMs between collectives; `0` = one full burst per collective. 8–64 is closer to a real transformer layer |
 | `--collective NAME` | `allreduce` | `allreduce`, `alltoall`, `sendrecv` |
@@ -174,9 +173,8 @@ Written to `runs/<timestamp>[-tag]/`:
 |---|---|
 | `manifest.txt` | provenance, topology and link baseline, which collectors ran, verdict |
 | `pcieburn.log` | timestamped console output and the final summary block |
-| `events.csv` | per-rank event log: `start, ready, all_ready, progress, peak, rank_lost, finish, killall` — one `progress` row per pass, per rank. `gbps` (before `note`) is effective DRAM GB/s, nonzero only with `--gemm-n` |
-| `nvml_trace.csv` | per-GPU power, SM clock, temp, util, PCIe link gen/width (columns 1–8, fixed), then memory clock, memory-controller utilization and clock-event reasons (sw power cap, hw slowdown, sw thermal) — whichever of those the driver accepts, listed as `nvml_fields` in the manifest |
-| `nvml_clocks_load.txt` | per GPU over the load window: median/min/max memory clock, mean memory utilization, % of samples power-capped, hw-slowed or thermally slowed |
+| `events.csv` | per-rank event log: `start, ready, all_ready, progress, peak, rank_lost, finish, killall` — one `progress` row per pass, per rank |
+| `nvml_trace.csv` | per-GPU power, clocks, temp, util, PCIe link gen/width |
 | `pcie_dmon.txt` | `nvidia-smi dmon` PCIe rx/tx throughput, an independent cross-check of the tool's own byte accounting |
 | `pcie_link_baseline.csv`, `pcie_link_states.txt`, `pcie_link_states_load.txt` | link gen/width before the run, and the distinct states observed with sample counts |
 | `pcie_link_rootports*.txt` / `.csv` | root-port link state before and after |
@@ -186,38 +184,6 @@ Written to `runs/<timestamp>[-tag]/`:
 
 Timestamps are UTC with milliseconds (`YYYY-MM-DDTHH:MM:SS.mmmZ`) throughout,
 matching the existing BMC/NVML pollers so traces join without reformatting.
-
-## Measuring memory bandwidth
-
-Autoregressive decode — generating one token at a time — is limited by how
-fast each GPU can stream its weights out of DRAM, not by tensor-core FLOPs.
-The default square GEMMs never exercise that. Two things cover it:
-
-**`--gemm-n N`** changes every GEMM to `C(dim×N) = Wᵢ(dim×dim) · X(dim×N)`.
-The large C-buffer pool becomes the weight set: every slot holds an identical
-copy of A, so outputs must still match and fault/NaN checking stays on. Each
-call reads a different slot, so the weights cannot be served from L2 (the run
-warns if the whole set is under 4× L2). Throughput is reported per pass as
-effective DRAM GB/s = (weight bytes + output bytes) ÷ GEMM time, in the
-console, `events.csv` (`gbps`) and a per-GPU peak table in the summary. GEMM
-time is summed per chunk, so the collectives between chunks are excluded (in
-this mode GFLOP/s uses the same GEMM-only time; square mode is unchanged). The
-`dim × N` activation is excluded from the byte count because it stays
-cache-resident. Use one `--precision`: the weight slots are shared across
-precisions, so alternating them refills the whole set every pass (outside the
-timed window, but it adds load).
-
-A decode-like arm pairs it with small collectives, since a token's activation
-is only `hidden × batch × 2` bytes:
-
-    ./run_pcieburn.sh --duration 600 --tag decode-n8 -- --matrix-dim 8192 \
-        --gemm-n 8 --precision half --always-tensor --gemms-per-coll 32 \
-        --coll-min 64K --coll-max 1M
-
-**The NVML trace** now carries memory clock, memory-controller utilization and
-clock-event reasons for every run, summarised in `nvml_clocks_load.txt`. That
-shows whether a power limit reaches the memory clock at all, and whether a
-nominal cap was ever binding.
 
 ## linkcheck.sh
 
