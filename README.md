@@ -133,7 +133,7 @@ it. The `--with-*` forms are accepted and ignored, for older command lines.
 | `--duration SEC` | `60` | run length |
 | `--matrix-dim N` | `2048` | GEMM dimension (DCGM's default) |
 | `--gemm-n N` | `0` | decode-shaped GEMMs: a `dim × dim` weight matrix times a `dim × N` activation (N = tokens in the batch). `0` = square, compute-bound. At small N (1–64) each GEMM streams its weights from DRAM and every pass reports effective memory GB/s — see [Measuring memory bandwidth](#measuring-memory-bandwidth) |
-| `--precision LIST` | `half,single` | comma list of `half,single,double` |
+| `--precision LIST` | `half,single` | comma list of `half,single,double,fp8,fp4`. `fp8`/`fp4` run through cuBLASLt — see [FP8 and FP4](#fp8-and-fp4) |
 | `--gemms-per-coll N` | `0` | GEMMs between collectives; `0` = one full burst per collective. 8–64 is closer to a real transformer layer |
 | `--collective NAME` | `allreduce` | `allreduce`, `alltoall`, `sendrecv` |
 | `--coll-min SIZE` | `128M` | smallest collective (binary suffixes) |
@@ -218,6 +218,36 @@ is only `hidden × batch × 2` bytes:
 clock-event reasons for every run, summarised in `nvml_clocks_load.txt`. That
 shows whether a power limit reaches the memory clock at all, and whether a
 nominal cap was ever binding.
+
+## FP8 and FP4
+
+`--precision fp8` (E4M3) and `--precision fp4` (NVFP4: E2M1 values with one E4M3
+scale per 16 elements) exercise the tensor-core formats inference actually uses. The
+classic cuBLAS API has no entry point for them, so they run through `cublasLtMatmul`:
+TN layout (A transposed, which cuBLASLt requires for these types), FP32 accumulate,
+FP16 output. They work in both square and `--gemm-n` decode mode, alongside or
+instead of the DCGM precisions.
+
+- **Data:** downcasts of the same DCGM random draw. Values in [0,10) round coarsely
+  in E4M3 and saturate at 6 in E2M1. Every NVFP4 block scale is 1.0.
+- **Fault checking stays on:** outputs are FP16 and still all equal A·B, so the FP16
+  compare kernel runs unchanged. alpha is 1/K, which keeps outputs finite; unscaled
+  sums overflow FP16 at large K, and an all-`Inf` output would make the compare
+  vacuous.
+- **Unsupported combinations fail fast:** before any rank starts, a probe asks
+  cuBLASLt for a kernel for each requested format at the run's exact shape on the
+  first GPU. If there isn't one, the run exits 1 with the reason. A setup failure
+  inside a rank would otherwise be reported as `COMPUTE FAULTS`.
+- **Decode mode:** weights are 1 byte (fp8) or 0.5 byte (fp4) per element in the
+  GB/s figure. All weight slots share one NVFP4 scale tensor, which stays in L2, so
+  its traffic isn't counted; real NVFP4 weights add 1/16 byte per element.
+- **Constraints:** `--matrix-dim` must be a multiple of 16 for fp8 and 32 for fp4.
+  `--no-tensor` is rejected with either.
+- **Reading the numbers:** GeForce parts have historically run FP8 at reduced rate
+  with FP32 accumulation, and FP32 is the only accumulate cuBLASLt offers here. Expect
+  measured TFLOP/s well below datasheet figures quoted with FP16 accumulate or
+  sparsity. DCGM never runs these formats, so these arms characterise power and
+  performance; they are not the fault-reproduction load.
 
 ## linkcheck.sh
 

@@ -14,8 +14,11 @@
 // fork + pipe rendezvous for the ncclUniqueId is enough for a single node and
 // keeps the launch path dependency-free.
 
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <nccl.h>
 
@@ -256,7 +259,20 @@ extern "C" __global__ void compareFP16(__half **C, int *faulty, int *nans,
 // Configuration
 // ---------------------------------------------------------------------------
 
-enum Precision { PREC_HALF = 0, PREC_SINGLE = 1, PREC_DOUBLE = 2 };
+// FP8 (E4M3) and FP4 (NVFP4: E2M1 with one E4M3 scale per 16 elements) have
+// no entry point in the classic cuBLAS API, so they run through cuBLASLt. Both
+// accumulate in FP32 and write FP16, which lets them reuse the FP16 output
+// slots and the FP16 compare kernel. DCGM never runs these precisions: they
+// are for power/performance characterisation of inference-style math, not
+// for reproducing the diagnostic's exact load.
+enum Precision {
+  PREC_HALF = 0,
+  PREC_SINGLE = 1,
+  PREC_DOUBLE = 2,
+  PREC_FP8 = 3,
+  PREC_FP4 = 4,
+  NPREC = 5
+};
 
 static const char *precName(Precision p) {
   switch (p) {
@@ -264,10 +280,16 @@ static const char *precName(Precision p) {
     return "half";
   case PREC_SINGLE:
     return "single";
-  default:
+  case PREC_DOUBLE:
     return "double";
+  case PREC_FP8:
+    return "fp8";
+  default:
+    return "fp4";
   }
 }
+
+static bool isLowPrec(Precision p) { return p == PREC_FP8 || p == PREC_FP4; }
 
 enum Collective { COLL_ALLREDUCE = 0, COLL_ALLTOALL = 1, COLL_SENDRECV = 2 };
 
@@ -450,9 +472,9 @@ struct DeviceBuffers {
   // each, FP16 aliases 4 — exactly DCGM's InitBuffers() layout, so the memory
   // footprint and per-precision GEMM counts match the reproducing run.
   std::vector<void *> base;
-  std::vector<void *> cHost[3]; // host-side pointer lists, per precision
-  void *cDev[3] = {nullptr, nullptr, nullptr}; // device arrays of pointers
-  size_t iters[3] = {0, 0, 0};
+  std::vector<void *> cHost[NPREC]; // host-side pointer lists, per precision
+  void *cDev[NPREC] = {};           // device arrays of pointers
+  size_t iters[NPREC] = {};
 
   // --gemm-n only. The base buffers above become the WEIGHT matrices (each
   // slot filled with an identical copy of A, so every output must still
@@ -460,9 +482,20 @@ struct DeviceBuffers {
   // live here instead, aliased per precision exactly like base: every
   // precision's outputs fit in 8*dim*N bytes per base buffer.
   void *skinnyC = nullptr;
-  std::vector<void *> sCHost[3];
-  void *sCDev[3] = {nullptr, nullptr, nullptr};
+  std::vector<void *> sCHost[NPREC];
+  void *sCDev[NPREC] = {};
   int weightsPrec = -1; // precision the weight slots currently hold
+
+  // fp8/fp4 inputs (square mode uses these directly; decode mode copies A
+  // into the weight slots) and the cuBLASLt state. Outputs are FP16 and live
+  // in the FP16 slots, which cHost/sCHost[PREC_FP8/FP4] alias.
+  void *aFP8 = nullptr, *bFP8 = nullptr; // 1 byte per element
+  void *aFP4 = nullptr, *bFP4 = nullptr; // 2 elements per byte
+  void *sfA = nullptr, *sfB = nullptr;   // NVFP4 block scales, all 1.0
+  float *scaleOne = nullptr;             // FP8 per-tensor scale, 1.0
+  void *ltWorkspace = nullptr;
+  cublasLtHandle_t lt = nullptr;
+  cudaStream_t ltStream = nullptr;
 
   int *faultyDev = nullptr;
   int *nanDev = nullptr;
@@ -545,18 +578,140 @@ static double gflopsPerGemm(unsigned dim) {
   return opsPer2048 * scale * scale * scale / 1073741824.0;
 }
 
+// ---------------------------------------------------------------------------
+// cuBLASLt plans for fp8/fp4. Built once per precision and shape. The same
+// builder runs in the pre-fork probe (to reject an unsupported combination
+// as a setup error before any rank exists) and in each rank, so the probe
+// answers exactly the question the ranks will ask.
+// ---------------------------------------------------------------------------
+
+static const size_t LT_WORKSPACE = 32ull << 20;
+
+struct LtPlan {
+  cublasLtMatmulDesc_t desc = nullptr;
+  cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+  cublasLtMatmulAlgo_t algo{};
+  bool ok = false;
+};
+
+// One plan per low precision, per rank process.
+static LtPlan g_ltPlan[NPREC];
+
+static size_t roundUp(size_t v, size_t m) { return (v + m - 1) / m * m; }
+
+// NVFP4 carries one UE4M3 scale per 16 elements along K. cuBLASLt stores them
+// in 128-row x 4-column tiles, so the tensor is padded to those multiples.
+// Every scale here is 1.0, so the tile swizzle never matters — only the size.
+static size_t nvfp4ScaleBytes(size_t outer, size_t k) {
+  return roundUp(outer, 128) * roundUp(k / 16, 4);
+}
+
+static void destroyLtPlan(LtPlan &p) {
+  if (p.a) cublasLtMatrixLayoutDestroy(p.a);
+  if (p.b) cublasLtMatrixLayoutDestroy(p.b);
+  if (p.c) cublasLtMatrixLayoutDestroy(p.c);
+  if (p.desc) cublasLtMatmulDescDestroy(p.desc);
+  p = LtPlan{};
+}
+
+// D(m x n, FP16) = op(A) * B with A stored k x m and transposed (cuBLASLt
+// requires the "TN" layout for fp8/fp4), B stored k x n, FP32 accumulation.
+// Scale pointers may be null when only probing for support. Returns "" on
+// success, otherwise a reason fit for a setup error.
+static std::string buildLtPlan(cublasLtHandle_t lt, Precision prec, int m,
+                               int n, int k, const void *scaleA,
+                               const void *scaleB, LtPlan &plan) {
+  char why[192];
+  cublasStatus_t st;
+#define LT_TRY(call)                                                           \
+  do {                                                                         \
+    st = (call);                                                               \
+    if (st != CUBLAS_STATUS_SUCCESS) {                                         \
+      snprintf(why, sizeof(why), "%s -> status %d", #call, (int)st);           \
+      destroyLtPlan(plan);                                                     \
+      return why;                                                              \
+    }                                                                          \
+  } while (0)
+  const cudaDataType_t in = prec == PREC_FP8 ? CUDA_R_8F_E4M3 : CUDA_R_4F_E2M1;
+  const cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+  LT_TRY(cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  LT_TRY(cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                        &tA, sizeof(tA)));
+  LT_TRY(cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                        &tB, sizeof(tB)));
+  if (prec == PREC_FP4) {
+    const int32_t mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    LT_TRY(cublasLtMatmulDescSetAttribute(
+        plan.desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)));
+    LT_TRY(cublasLtMatmulDescSetAttribute(
+        plan.desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode)));
+  }
+  if (scaleA)
+    LT_TRY(cublasLtMatmulDescSetAttribute(
+        plan.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA,
+        sizeof(scaleA)));
+  if (scaleB)
+    LT_TRY(cublasLtMatmulDescSetAttribute(
+        plan.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB,
+        sizeof(scaleB)));
+  LT_TRY(cublasLtMatrixLayoutCreate(&plan.a, in, k, m, k));
+  LT_TRY(cublasLtMatrixLayoutCreate(&plan.b, in, k, n, k));
+  LT_TRY(cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16F, m, n, m));
+
+  cublasLtMatmulPreference_t pref = nullptr;
+  LT_TRY(cublasLtMatmulPreferenceCreate(&pref));
+  const size_t ws = LT_WORKSPACE;
+  st = cublasLtMatmulPreferenceSetAttribute(
+      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws));
+  cublasLtMatmulHeuristicResult_t res{};
+  int found = 0;
+  if (st == CUBLAS_STATUS_SUCCESS)
+    st = cublasLtMatmulAlgoGetHeuristic(lt, plan.desc, plan.a, plan.b, plan.c,
+                                        plan.c, pref, 1, &res, &found);
+  cublasLtMatmulPreferenceDestroy(pref);
+  if (st != CUBLAS_STATUS_SUCCESS || found == 0) {
+    snprintf(why, sizeof(why),
+             "cuBLASLt has no %s kernel for m=%d n=%d k=%d on this GPU "
+             "(heuristic status %d, %d algorithms)",
+             precName(prec), m, n, k, (int)st, found);
+    destroyLtPlan(plan);
+    return why;
+  }
+#undef LT_TRY
+  plan.algo = res.algo;
+  plan.ok = true;
+  return "";
+}
+
 // Bytes one decode-shaped GEMM must move through DRAM: the dim x dim weight
 // matrix (a different slot every call, so it cannot be served from L2) plus
 // the dim x N output write. The dim x N activation is re-read by every call
 // and stays cache-resident, so it is deliberately not counted — including it
 // would credit L2 hits to DRAM bandwidth.
+// For fp4 the weights' block scales are not counted: every weight slot here
+// shares one scale tensor, which stays in L2. Real NVFP4 weights carry their
+// own scales, adding 1/16 byte per element to the true traffic.
 static double bytesPerSkinnyGemm(unsigned dim, unsigned n, Precision prec) {
-  const double el = prec == PREC_HALF ? 2.0 : prec == PREC_SINGLE ? 4.0 : 8.0;
-  return el * ((double)dim * dim + (double)dim * n);
+  double w, out;
+  switch (prec) {
+  case PREC_HALF:   w = 2.0; out = 2.0; break;
+  case PREC_SINGLE: w = 4.0; out = 4.0; break;
+  case PREC_DOUBLE: w = 8.0; out = 8.0; break;
+  case PREC_FP8:    w = 1.0; out = 2.0; break; // FP16 output
+  default:          w = 0.5; out = 2.0; break; // FP4 packed, FP16 output
+  }
+  return w * (double)dim * dim + out * (double)dim * n;
 }
 
-static size_t precBytes(Precision prec) {
-  return prec == PREC_HALF ? 2 : prec == PREC_SINGLE ? 4 : 8;
+// Bytes of one dim x dim input matrix in this precision.
+static size_t matBytes(Precision prec, size_t dim) {
+  switch (prec) {
+  case PREC_HALF:   return 2 * dim * dim;
+  case PREC_SINGLE: return 4 * dim * dim;
+  case PREC_DOUBLE: return 8 * dim * dim;
+  case PREC_FP8:    return dim * dim;
+  default:          return dim * dim / 2;
+  }
 }
 
 // "4MiB" for anything >= 1 MiB (unchanged from earlier bundles, so existing
@@ -654,6 +809,28 @@ static void gemmBurst(const Config &cfg, DeviceBuffers &db, cublasHandle_t cub,
 
   const int dim = (int)cfg.matrixDim;
 
+  if (isLowPrec(prec)) {
+    // fp8/fp4 through cuBLASLt, same unpaced launch loop. Square mode
+    // multiplies the fixed A*B into rotating FP16 outputs; decode mode reads
+    // a different weight slot each call, as the FP16/32/64 path does.
+    // alpha = 1/K keeps every FP16 output finite. At DCGM's value range and
+    // K = 8192 an unscaled sum reaches ~2e5, past FP16's 65504: outputs go
+    // to Inf, Inf - Inf is NaN, NaN never compares as a mismatch, and fault
+    // detection silently stops meaning anything.
+    const float alpha = 1.0f / (float)dim, zero = 0.0f;
+    const LtPlan &pl = g_ltPlan[prec];
+    const void *bIn = prec == PREC_FP8 ? db.bFP8 : db.bFP4;
+    const void *aFixed = prec == PREC_FP8 ? db.aFP8 : db.aFP4;
+    for (size_t i = from; i < to; i++) {
+      const void *aIn = cfg.gemmN ? db.cHost[prec][i] : aFixed;
+      void *d = cfg.gemmN ? db.sCHost[prec][i] : db.cHost[prec][i];
+      CUBLAS_CHECK(cublasLtMatmul(db.lt, pl.desc, &alpha, aIn, pl.a, bIn, pl.b,
+                                  &zero, d, pl.c, d, pl.c, &pl.algo,
+                                  db.ltWorkspace, LT_WORKSPACE, db.ltStream));
+    }
+    return;
+  }
+
   if (cfg.gemmN) {
     // Decode shape: W_i (the base slot) times the fixed activation X, into a
     // small per-iteration output. Same unpaced, sync-free launch pattern.
@@ -718,7 +895,7 @@ static void runCompare(const Config &cfg, DeviceBuffers &db, Precision prec,
 
   // DCGM's geometry: grid (64,64), block (32,8).
   dim3 grid(64, 64, 1), block(32, 8, 1);
-  if (prec == PREC_HALF)
+  if (prec == PREC_HALF || isLowPrec(prec)) // fp8/fp4 write FP16 outputs
     compareFP16<<<grid, block, 0, stream>>>(
         (__half **)outDev, db.faultyDev, db.nanDev, iters, nElems);
   else if (prec == PREC_SINGLE)
@@ -819,7 +996,18 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
   CUDA_CHECK(cudaMemGetInfo(&freeB, &totalB));
   const size_t useBytes = (size_t)((double)freeB * cfg.memFrac);
 
-  const size_t abBytes = 2 * (rs64 + rs32 + rs16);
+  bool wantLow[NPREC] = {};
+  for (Precision p : cfg.precisions)
+    wantLow[p] = isLowPrec(p);
+  const bool anyLow = wantLow[PREC_FP8] || wantLow[PREC_FP4];
+  const size_t lowN = cfg.gemmN ? cfg.gemmN : dim;
+  const size_t sfABytes = wantLow[PREC_FP4] ? nvfp4ScaleBytes(dim, dim) : 0;
+  const size_t sfBBytes = wantLow[PREC_FP4] ? nvfp4ScaleBytes(lowN, dim) : 0;
+  const size_t lowBytes =
+      (wantLow[PREC_FP8] ? 2 * matBytes(PREC_FP8, dim) : 0) +
+      (wantLow[PREC_FP4] ? 2 * matBytes(PREC_FP4, dim) : 0) + sfABytes +
+      sfBBytes + (anyLow ? LT_WORKSPACE : 0);
+  const size_t abBytes = 2 * (rs64 + rs32 + rs16) + lowBytes;
   if (useBytes <= abBytes + rs64)
     RANK_DIE("insufficient free VRAM: %.2f GiB free, need > %.2f GiB",
              (double)freeB / 1073741824.0,
@@ -885,7 +1073,13 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
     for (int j = 0; j < 4; j++)
       db.cHost[PREC_HALF].push_back(b + (size_t)j * rs16);
   }
-  for (int p = 0; p < 3; p++) {
+  // fp8/fp4 write FP16 outputs into the FP16 slots (and, in decode mode,
+  // keep their weights there: a 1- or 0.5-byte matrix fits a 2-byte slot).
+  for (Precision lp : {PREC_FP8, PREC_FP4}) {
+    db.cHost[lp] = db.cHost[PREC_HALF];
+    db.iters[lp] = db.iters[PREC_HALF];
+  }
+  for (int p = 0; p < NPREC; p++) {
     const size_t n = db.cHost[p].size();
     CUDA_CHECK(cudaMalloc(&db.cDev[p], n * sizeof(void *)));
     CUDA_CHECK(cudaMemcpy(db.cDev[p], db.cHost[p].data(), n * sizeof(void *),
@@ -903,7 +1097,9 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
       for (int j = 0; j < 4; j++)
         db.sCHost[PREC_HALF].push_back(b + (size_t)j * 2 * dim * n);
     }
-    for (int p = 0; p < 3; p++) {
+    for (Precision lp : {PREC_FP8, PREC_FP4})
+      db.sCHost[lp] = db.sCHost[PREC_HALF];
+    for (int p = 0; p < NPREC; p++) {
       const size_t cnt = db.sCHost[p].size();
       CUDA_CHECK(cudaMalloc(&db.sCDev[p], cnt * sizeof(void *)));
       CUDA_CHECK(cudaMemcpy(db.sCDev[p], db.sCHost[p].data(),
@@ -933,6 +1129,67 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
     CUDA_CHECK(cudaMemcpy(db.bFP32, hB32.data(), rs32, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(db.aFP16, hA16.data(), rs16, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(db.bFP16, hB16.data(), rs16, cudaMemcpyHostToDevice));
+
+    // fp8/fp4 are downcasts of the same FP32 draw. DCGM's values lie in
+    // [0,10): E4M3 holds them with coarse rounding, E2M1 saturates at 6 and
+    // keeps only {0,.5,1,1.5,2,3,4,6}. Fine for load — and since every output
+    // is still the same A*B, the compare kernel still catches faults.
+    if (wantLow[PREC_FP8]) {
+      std::vector<__nv_fp8_storage_t> h8a(n), h8b(n);
+      for (size_t i = 0; i < n; i++) {
+        h8a[i] = __nv_cvt_float_to_fp8(hA32[i], __NV_SATFINITE, __NV_E4M3);
+        h8b[i] = __nv_cvt_float_to_fp8(hB32[i], __NV_SATFINITE, __NV_E4M3);
+      }
+      CUDA_CHECK(cudaMalloc(&db.aFP8, n));
+      CUDA_CHECK(cudaMalloc(&db.bFP8, n));
+      CUDA_CHECK(cudaMemcpy(db.aFP8, h8a.data(), n, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(db.bFP8, h8b.data(), n, cudaMemcpyHostToDevice));
+    }
+    if (wantLow[PREC_FP4]) {
+      std::vector<__nv_fp4x2_storage_t> h4a(n / 2), h4b(n / 2);
+      for (size_t i = 0; i < n / 2; i++) {
+        h4a[i] = __nv_cvt_float2_to_fp4x2(
+            make_float2(hA32[2 * i], hA32[2 * i + 1]), __NV_E2M1,
+            cudaRoundNearest);
+        h4b[i] = __nv_cvt_float2_to_fp4x2(
+            make_float2(hB32[2 * i], hB32[2 * i + 1]), __NV_E2M1,
+            cudaRoundNearest);
+      }
+      CUDA_CHECK(cudaMalloc(&db.aFP4, n / 2));
+      CUDA_CHECK(cudaMalloc(&db.bFP4, n / 2));
+      CUDA_CHECK(cudaMemcpy(db.aFP4, h4a.data(), n / 2, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(db.bFP4, h4b.data(), n / 2, cudaMemcpyHostToDevice));
+      // UE4M3 1.0 is the byte 0x38 (exponent 7 = bias, mantissa 0).
+      const unsigned char one = __nv_cvt_float_to_fp8(1.0f, __NV_SATFINITE,
+                                                      __NV_E4M3);
+      CUDA_CHECK(cudaMalloc(&db.sfA, sfABytes));
+      CUDA_CHECK(cudaMalloc(&db.sfB, sfBBytes));
+      CUDA_CHECK(cudaMemset(db.sfA, one, sfABytes));
+      CUDA_CHECK(cudaMemset(db.sfB, one, sfBBytes));
+    }
+  }
+
+  if (anyLow) {
+    CUBLAS_CHECK(cublasLtCreate(&db.lt));
+    db.ltStream = stream;
+    CUDA_CHECK(cudaMalloc(&db.ltWorkspace, LT_WORKSPACE));
+    const float oneF = 1.0f;
+    CUDA_CHECK(cudaMalloc(&db.scaleOne, sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(db.scaleOne, &oneF, sizeof(float),
+                          cudaMemcpyHostToDevice));
+    for (Precision lp : {PREC_FP8, PREC_FP4}) {
+      if (!wantLow[lp])
+        continue;
+      const void *sa = lp == PREC_FP8 ? (const void *)db.scaleOne : db.sfA;
+      const void *sb = lp == PREC_FP8 ? (const void *)db.scaleOne : db.sfB;
+      // The pre-fork probe already confirmed support, so a failure here is
+      // unexpected; it still has to be loud rather than a silent skip.
+      const std::string why = buildLtPlan(db.lt, lp, (int)dim, (int)lowN,
+                                          (int)dim, sa, sb, g_ltPlan[lp]);
+      if (!why.empty())
+        RANK_DIE("%s plan failed after a successful probe: %s", precName(lp),
+                 why.c_str());
+    }
   }
 
   CUDA_CHECK(cudaMemGetInfo(&freeB, &totalB));
@@ -1008,8 +1265,10 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
       if (cfg.gemmN && db.weightsPrec != (int)prec) {
         const void *src = prec == PREC_HALF     ? db.aFP16
                           : prec == PREC_SINGLE ? db.aFP32
-                                                : db.aFP64;
-        const size_t bytes = precBytes(prec) * cfg.matrixDim * cfg.matrixDim;
+                          : prec == PREC_DOUBLE ? db.aFP64
+                          : prec == PREC_FP8    ? db.aFP8
+                                                : db.aFP4;
+        const size_t bytes = matBytes(prec, cfg.matrixDim);
         for (size_t i = 0; i < iters; i++)
           CUDA_CHECK(cudaMemcpyAsync(db.cHost[prec][i], src, bytes,
                                      cudaMemcpyDeviceToDevice, stream));
@@ -1194,10 +1453,21 @@ static void runRank(const Config &cfg, int rank, int nranks, int device,
 
   for (size_t i = 0; i < db.base.size(); i++)
     cudaFree(db.base[i]);
-  for (int p = 0; p < 3; p++) {
+  for (int p = 0; p < NPREC; p++) {
     cudaFree(db.cDev[p]);
     cudaFree(db.sCDev[p]);
+    destroyLtPlan(g_ltPlan[p]);
   }
+  cudaFree(db.aFP8);
+  cudaFree(db.bFP8);
+  cudaFree(db.aFP4);
+  cudaFree(db.bFP4);
+  cudaFree(db.sfA);
+  cudaFree(db.sfB);
+  cudaFree(db.scaleOne);
+  cudaFree(db.ltWorkspace);
+  if (db.lt)
+    cublasLtDestroy(db.lt);
   cudaFree(db.skinnyC);
   cudaFree(db.aFP64);
   cudaFree(db.bFP64);
@@ -1279,9 +1549,13 @@ static void usage(const char *argv0) {
       "                        and every pass reports effective memory GB/s.\n"
       "                        Use one --precision; alternating precisions\n"
       "                        refills the weight set every pass.\n"
-      "  --precision LIST      comma list of half,single,double (default "
+      "  --precision LIST      comma list of half,single,double,fp8,fp4 (default "
       "half,single,\n"
-      "                        matching DCGM's default set on a consumer GPU)\n"
+      "                        matching DCGM's default set on a consumer GPU).\n"
+      "                        fp8 (E4M3) and fp4 (NVFP4) run through cuBLASLt\n"
+      "                        on tensor cores with FP32 accumulate and FP16\n"
+      "                        output; not part of DCGM's load. fp8 needs\n"
+      "                        --matrix-dim %% 16 == 0, fp4 %% 32 == 0.\n"
       "  --gemms-per-coll N    GEMMs between collectives; 0 = one full "
       "DCGM-style\n"
       "                        burst per collective (default 0). Small values "
@@ -1391,6 +1665,10 @@ static bool parseArgs(int argc, char **argv, Config &cfg) {
           cfg.precisions.push_back(PREC_SINGLE);
         else if (t == "double")
           cfg.precisions.push_back(PREC_DOUBLE);
+        else if (t == "fp8")
+          cfg.precisions.push_back(PREC_FP8);
+        else if (t == "fp4")
+          cfg.precisions.push_back(PREC_FP4);
         else if (!t.empty()) {
           fprintf(stderr, "unknown precision '%s'\n", t.c_str());
           return false;
@@ -1399,7 +1677,8 @@ static bool parseArgs(int argc, char **argv, Config &cfg) {
       }
       if (cfg.precisions.empty()) {
         fprintf(stderr,
-                "--precision needs at least one of half,single,double\n");
+                "--precision needs at least one of "
+                "half,single,double,fp8,fp4\n");
         return false;
       }
     } else if (!strcmp(a, "--gemms-per-coll")) {
@@ -1541,6 +1820,24 @@ static bool parseArgs(int argc, char **argv, Config &cfg) {
             cfg.matrixDim);
     return false;
   }
+  bool wantFp8 = false, wantFp4 = false;
+  for (Precision p : cfg.precisions) {
+    wantFp8 |= p == PREC_FP8;
+    wantFp4 |= p == PREC_FP4;
+  }
+  // cuBLASLt's block-scaled FP4 needs K in whole 16-element scale blocks and
+  // 16-byte-aligned packed columns (32 FP4 values); FP8 needs 16-byte rows.
+  if ((wantFp4 && cfg.matrixDim % 32 != 0) ||
+      (wantFp8 && cfg.matrixDim % 16 != 0)) {
+    fprintf(stderr, "--matrix-dim must be a multiple of %d for %s (got %u)\n",
+            wantFp4 ? 32 : 16, wantFp4 ? "fp4" : "fp8", cfg.matrixDim);
+    return false;
+  }
+  if ((wantFp8 || wantFp4) && cfg.noTensor) {
+    fprintf(stderr, "--no-tensor cannot apply to fp8/fp4: tensor cores are "
+                    "their only execution path\n");
+    return false;
+  }
   if (cfg.noTensor && cfg.alwaysTensor) {
     fprintf(stderr, "--no-tensor and --always-tensor are contradictory\n");
     return false;
@@ -1594,6 +1891,83 @@ static int probeDeviceCount() {
   return n;
 }
 
+// fp8/fp4 support check, in a short-lived child for the same reason as the
+// device-count probe. It must happen before any rank starts: a rank that dies
+// in setup is reported as COMPUTE FAULTS (it exits with EXIT_RANK_FAILURE),
+// which would misreport "this cuBLASLt has no fp4 kernel for sm_120" as the
+// very class of fault this tool hunts. Returns "" if every requested low
+// precision has a kernel for the run's shape on the first selected GPU.
+static std::string probeLowPrecision(const Config &cfg) {
+  bool any = false;
+  for (Precision p : cfg.precisions)
+    any |= isLowPrec(p);
+  if (!any)
+    return "";
+
+  int fds[2];
+  if (pipe(fds) != 0)
+    return "pipe() failed for the fp8/fp4 probe";
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return "fork() failed for the fp8/fp4 probe";
+  }
+  if (pid == 0) {
+    close(fds[0]);
+    char out[512] = "";
+    cudaDeviceProp prop;
+    cublasLtHandle_t lt = nullptr;
+    if (cudaSetDevice(cfg.gpus[0]) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, cfg.gpus[0]) != cudaSuccess) {
+      snprintf(out, sizeof(out), "cannot open device %d", cfg.gpus[0]);
+    } else if (cublasLtCreate(&lt) != CUBLAS_STATUS_SUCCESS) {
+      snprintf(out, sizeof(out), "cublasLtCreate failed on device %d",
+               cfg.gpus[0]);
+    } else {
+      const int dim = (int)cfg.matrixDim;
+      const int n = cfg.gemmN ? (int)cfg.gemmN : dim;
+      // Real scale buffers of the right size, not nulls, so the heuristic
+      // sees exactly the descriptor a rank will build.
+      void *sfA = nullptr, *sfB = nullptr, *one = nullptr;
+      cudaMalloc(&sfA, nvfp4ScaleBytes(dim, dim));
+      cudaMalloc(&sfB, nvfp4ScaleBytes(n, dim));
+      cudaMalloc(&one, sizeof(float));
+      for (Precision p : cfg.precisions) {
+        if (!isLowPrec(p))
+          continue;
+        LtPlan plan;
+        const std::string why =
+            p == PREC_FP8 ? buildLtPlan(lt, p, dim, n, dim, one, one, plan)
+                          : buildLtPlan(lt, p, dim, n, dim, sfA, sfB, plan);
+        destroyLtPlan(plan);
+        if (!why.empty()) {
+          snprintf(out, sizeof(out), "%s on %s (sm_%d%d, cuBLASLt %zu): %s",
+                   precName(p), prop.name, prop.major, prop.minor,
+                   cublasLtGetVersion(), why.c_str());
+          break;
+        }
+      }
+      cudaFree(sfA);
+      cudaFree(sfB);
+      cudaFree(one);
+      cublasLtDestroy(lt);
+    }
+    writeAll(fds[1], out, sizeof(out));
+    close(fds[1]);
+    _exit(0);
+  }
+  close(fds[1]);
+  char out[512] = "";
+  if (!readAll(fds[0], out, sizeof(out)))
+    snprintf(out, sizeof(out), "fp8/fp4 probe child died");
+  close(fds[0]);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  out[sizeof(out) - 1] = '\0';
+  return out;
+}
+
 struct RankState {
   pid_t pid = -1;
   int readFd = -1;
@@ -1610,8 +1984,8 @@ struct RankState {
   // Peak GEMM throughput per precision. Tracked separately because half and
   // single differ by roughly 4x, so a single combined peak would report only
   // the half figure and hide the FP32 number entirely.
-  double peakGflops[3] = {0.0, 0.0, 0.0};
-  double peakGbps[3] = {0.0, 0.0, 0.0}; // --gemm-n runs only
+  double peakGflops[NPREC] = {};
+  double peakGbps[NPREC] = {}; // --gemm-n runs only
 };
 
 static FILE *g_eventLog = nullptr;
@@ -1692,6 +2066,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  {
+    const std::string why = probeLowPrecision(cfg);
+    if (!why.empty()) {
+      fprintf(stderr, "unsupported precision: %s\n", why.c_str());
+      return 1;
+    }
+  }
+
   if (!cfg.eventLog.empty()) {
     const bool fresh = access(cfg.eventLog.c_str(), F_OK) != 0;
     g_eventLog = fopen(cfg.eventLog.c_str(), "a");
@@ -1738,6 +2120,18 @@ int main(int argc, char **argv) {
           collName(cfg.collective), sizeLabel(cfg.collMin).c_str(),
           sizeLabel(cfg.collMax).c_str(), cfg.collFactor, collSizeCount(cfg),
           burstDesc.c_str());
+    {
+      bool low = false, fp4 = false;
+      for (Precision p : cfg.precisions) {
+        low |= isLowPrec(p);
+        fp4 |= p == PREC_FP4;
+      }
+      if (low)
+        logf_("  fp8/fp4 via cuBLASLt %zu: TN layout, FP32 accumulate, FP16 "
+              "output%s",
+              cublasLtGetVersion(),
+              fp4 ? "; fp4 is NVFP4 with all block scales 1.0" : "");
+    }
     if (cfg.gemmN)
       logf_("  gemm_n=%u: decode-shaped GEMMs (%u x %u weights x %u tokens), "
             "reporting effective DRAM GB/s per pass",
@@ -1986,10 +2380,10 @@ int main(int argc, char **argv) {
                 m.gflops, bw, (long long)m.faulty, (long long)m.nans);
         }
         eventLogWrite(cfg, "progress", r, &m, m.text);
-        if (m.precision >= 0 && m.precision < 3 &&
+        if (m.precision >= 0 && m.precision < NPREC &&
             m.gflops > ranks[r].peakGflops[m.precision])
           ranks[r].peakGflops[m.precision] = m.gflops;
-        if (m.precision >= 0 && m.precision < 3 &&
+        if (m.precision >= 0 && m.precision < NPREC &&
             m.gbps > ranks[r].peakGbps[m.precision])
           ranks[r].peakGbps[m.precision] = m.gbps;
         if (m.faulty || m.nans) {
